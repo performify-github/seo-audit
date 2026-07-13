@@ -69,6 +69,7 @@ CLASS_OF = {
     "rate-limited": MATERIAL,
     "no-https-redirect": MATERIAL,
     # opportunities
+    "temporary-https-redirect": OPPORTUNITY,
     "duplicate-description": OPPORTUNITY,
     "missing-description": OPPORTUNITY,
     "missing-h1": OPPORTUNITY,
@@ -97,8 +98,8 @@ CLASS_OF = {
 
 # issues whose subject is one technical URL but whose scope is the whole site —
 # ranked with affected = every crawled page, not 1/crawled
-SITE_WIDE = {"robots-blocks-all", "no-https-redirect", "robots-missing",
-             "robots-no-sitemap", "robots-blocks-audit-ua"}
+SITE_WIDE = {"robots-blocks-all", "no-https-redirect", "temporary-https-redirect",
+             "robots-missing", "robots-no-sitemap", "robots-blocks-audit-ua"}
 
 FIX_HINTS = {
     # blockers — direct fix language
@@ -121,6 +122,7 @@ FIX_HINTS = {
     "rate-limited": "The origin throttled the crawl (429/503) even after backoff — these pages were NOT audited. Rerun with --workers 2 --delay 1.",
     "no-https-redirect": "http:// version doesn't redirect to https — duplicate-protocol indexing risk.",
     # opportunities — review-not-fix language
+    "temporary-https-redirect": "http redirects to https with a temporary status (302/303/307) — works, but review making it 301/308 so the signal is unambiguous.",
     "duplicate-description": "Several pages share one description — review whether per-page copy is worth writing on key templates; Google generates its own snippets anyway.",
     "missing-description": "No meta description — Google generates the snippet. Review whether hand-written descriptions would present key pages better; not a ranking factor.",
     "missing-h1": "No <h1> found in the raw HTML — review whether the main heading is marked up as one; worth tidying, not urgent.",
@@ -167,6 +169,7 @@ ISSUE_LABELS = {
     "internal-link-broken": "Internal links to broken pages",
     "rate-limited": "Rate-limited (not audited)",
     "no-https-redirect": "No http-to-https redirect",
+    "temporary-https-redirect": "Temporary http-to-https redirect (not 301/308)",
     "missing-description": "Missing meta descriptions",
     "missing-h1": "Pages without an <h1>",
     "title-length": "Titles outside the display band",
@@ -229,6 +232,7 @@ IMPACT = {
     "internal-link-broken": (3, 4),
     "rate-limited": (3, 3),
     "no-https-redirect": (3, 4),
+    "temporary-https-redirect": (1, 3),
     "missing-description": (2, 3),
     "missing-h1": (2, 2),
     "title-length": (1, 2),
@@ -263,6 +267,7 @@ ISSUE_PHRASES = {
     "internal-link-broken": "{n} internally linked URL{s} returning 4xx/5xx",
     "rate-limited": "{n} URL{s} the origin rate-limited (a coverage gap, not a fault)",
     "no-https-redirect": "an http version that does not redirect to https",
+    "temporary-https-redirect": "an http-to-https redirect using a temporary status",
     "missing-description": "{n} page{s} without a meta description",
     "missing-h1": "{n} page{s} without an <h1>",
     "title-length": "{n} page{s} with titles outside the typical display length",
@@ -1172,6 +1177,23 @@ def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4, dea
     return issues, sources_by_code
 
 
+def judge_http_probe(h):
+    """Classify the plain-http probe. Returns (code, detail) or None if fine.
+
+    A 307/302 to https WORKS — reporting it as 'no redirect' would be false.
+    It's only a review item (make it permanent), never a material fault."""
+    if h["error"] is not None:
+        return None  # http not answering at all is fine — nothing to consolidate
+    if h["status"] in (301, 308):
+        return None
+    loc = h["headers"].get("Location", "")
+    if h["status"] in (302, 303, 307):
+        if loc.startswith("https://"):
+            return ("temporary-https-redirect", f"HTTP {h['status']} -> {loc}")
+        return ("no-https-redirect", f"HTTP {h['status']} -> {loc or '?'} (not https)")
+    return ("no-https-redirect", f"HTTP {h['status']} (expected 301/308)")
+
+
 def site_checks(base_url, pages, sitemap_urls, log, robots_result=None):
     """Site-level checks: robots.txt (including per-URL validation of every
     sitemap URL against Googlebot), https enforcement, duplicates.
@@ -1219,9 +1241,10 @@ def site_checks(base_url, pages, sitemap_urls, log, robots_result=None):
 
     if parsed.scheme == "https":
         h = fetch(f"http://{parsed.netloc}/", follow=False)
-        if h["status"] not in (301, 308) and h["error"] is None:
-            issues["no-https-redirect"].append((CLASS_OF["no-https-redirect"], f"http://{parsed.netloc}/",
-                                                f"HTTP {h['status']} (expected 301)"))
+        verdict = judge_http_probe(h)
+        if verdict:
+            issues[verdict[0]].append((CLASS_OF[verdict[0]], f"http://{parsed.netloc}/",
+                                       verdict[1]))
 
     # duplicates only across indexable, non-redirected, self-canonical pages —
     # a redirected sitemap URL parses its destination's metadata, and pages

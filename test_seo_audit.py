@@ -868,6 +868,35 @@ class TestThrottle(unittest.TestCase):
             srv.shutdown()
 
 
+# ---------------------------------------------------------------- http probe judgment
+class TestHttpProbeJudgment(unittest.TestCase):
+    def _h(self, status, location=None, error=None):
+        return {"status": status, "error": error,
+                "headers": {"Location": location} if location else {}}
+
+    def test_permanent_redirect_is_fine(self):
+        self.assertIsNone(sa.judge_http_probe(self._h(301, "https://x/")))
+        self.assertIsNone(sa.judge_http_probe(self._h(308, "https://x/")))
+
+    def test_temporary_https_redirect_is_review_not_fault(self):
+        # a 307 to https WORKS — must never be reported as "no redirect"
+        code, detail = sa.judge_http_probe(self._h(307, "https://x/"))
+        self.assertEqual(code, "temporary-https-redirect")
+        self.assertEqual(sa.CLASS_OF[code], sa.OPPORTUNITY)
+        self.assertIn("307", detail)
+
+    def test_temporary_redirect_to_http_is_material(self):
+        code, _ = sa.judge_http_probe(self._h(302, "http://x/elsewhere"))
+        self.assertEqual(code, "no-https-redirect")
+
+    def test_no_redirect_is_material(self):
+        code, _ = sa.judge_http_probe(self._h(200))
+        self.assertEqual(code, "no-https-redirect")
+
+    def test_http_not_answering_is_fine(self):
+        self.assertIsNone(sa.judge_http_probe(self._h(None, error="ConnectionRefused")))
+
+
 # ---------------------------------------------------------------- discovery cap
 class TestSitemapDiscoveryCap(unittest.TestCase):
     def test_truncation_is_flagged_and_reported(self):
