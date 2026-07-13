@@ -62,7 +62,10 @@ FIX_HINTS = {
     "description-length": "Aim for 70-160 chars so the snippet neither truncates nor looks empty.",
     "large-html": "HTML documents over 300KB slow first paint and waste crawl budget.",
     "non-html": "Sitemap URL returned a non-HTML content type; verify it belongs in the page sitemap.",
+    "rate-limited": "The origin throttled the crawl (429/503) even after backoff — these pages were NOT audited. Rerun with --workers 2 --delay 1.",
 }
+
+RATE_LIMIT_STATUSES = (429, 503)
 
 
 # ---------------------------------------------------------------- fetching
@@ -119,6 +122,22 @@ def fetch(url, timeout=TIMEOUT, follow=True):
             "headers": {}, "body": b""}
 
 
+def fetch_with_retry(url, timeout=TIMEOUT, retries=2):
+    """fetch(), backing off and retrying on 429/503 (honours Retry-After, capped 15s)."""
+    r = fetch(url, timeout)
+    for attempt in range(retries):
+        if r["status"] not in RATE_LIMIT_STATUSES:
+            break
+        ra = r["headers"].get("Retry-After")
+        try:
+            wait = min(float(ra), 15.0) if ra else 2.0 * (attempt + 1)
+        except ValueError:
+            wait = 2.0 * (attempt + 1)
+        time.sleep(wait)
+        r = fetch(url, timeout)
+    return r
+
+
 def decode_body(result):
     ctype = result["headers"].get("Content-Type", "")
     m = re.search(r"charset=([\w-]+)", ctype)
@@ -163,7 +182,7 @@ def discover_and_load_sitemaps(start_url, log):
         if sm in seen:
             continue
         seen.add(sm)
-        r = fetch(sm)
+        r = fetch_with_retry(sm)
         if r["status"] != 200 or not r["body"]:
             continue
         p, children = parse_sitemap_xml(decode_body(r))
@@ -284,6 +303,9 @@ def audit_page(result):
         else:
             issues.append((CRITICAL, "fetch-failed", result["error"]))
         return issues, data
+    if result["status"] in RATE_LIMIT_STATUSES:
+        issues.append((WARNING, "rate-limited", f"HTTP {result['status']} after retries"))
+        return issues, data
     if result["status"] >= 400:
         issues.append((CRITICAL, "http-error", f"HTTP {result['status']}"))
         return issues, data
@@ -370,8 +392,10 @@ def site_checks(base_url, pages, log):
     parsed = urllib.parse.urlparse(base_url)
     root = f"{parsed.scheme}://{parsed.netloc}"
 
-    r = fetch(root + "/robots.txt")
-    if r["status"] != 200:
+    r = fetch_with_retry(root + "/robots.txt")
+    if r["status"] in RATE_LIMIT_STATUSES:
+        issues["rate-limited"].append((WARNING, root + "/robots.txt", f"HTTP {r['status']} after retries"))
+    elif r["status"] != 200:
         issues["robots-missing"].append((WARNING, root + "/robots.txt", f"HTTP {r['status']}"))
     else:
         body = decode_body(r)
@@ -404,7 +428,7 @@ def c(code, s, tty):
     return f"\033[{code}m{s}\033[0m" if tty else s
 
 
-def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=False, md=False):
+def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=False, md=False, skipped=0):
     sev_colour = {CRITICAL: "31;1", WARNING: "33", NOTICE: "36"}
     lines = []
     w = lines.append
@@ -417,6 +441,8 @@ def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=Fa
             statuses["error"] += 1
         elif r["chain"]:
             statuses["redirect"] += 1
+        elif r["status"] in RATE_LIMIT_STATUSES:
+            statuses["rate-limited"] += 1
         elif r["status"] >= 400:
             statuses[f"{r['status'] // 100}xx"] += 1
         else:
@@ -432,10 +458,13 @@ def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=Fa
     w(f"# SEO audit — {host}" if md else c("1;4", f"SEO AUDIT — {host}", tty))
     w("")
     sample_note = f" (sampled from {len(page_urls)} in sitemap)" if sampled else ""
-    w(f"Crawled {len(results)} pages{sample_note} in {elapsed:.0f}s.")
+    budget_note = f" — time budget hit, {skipped} URLs not crawled" if skipped else ""
+    w(f"Crawled {len(results)} pages{sample_note} in {elapsed:.0f}s{budget_note}.")
     ok = statuses.get("200", 0)
+    rate_limited = statuses.get("rate-limited", 0)
+    rl_note = f" · {rate_limited} rate-limited (NOT audited)" if rate_limited else ""
     w(f"Status: {ok} OK · {statuses.get('redirect', 0)} redirected · "
-      f"{statuses.get('4xx', 0) + statuses.get('5xx', 0)} broken · {statuses.get('error', 0)} unreachable. "
+      f"{statuses.get('4xx', 0) + statuses.get('5xx', 0)} broken · {statuses.get('error', 0)} unreachable{rl_note}. "
       f"Response time median {statistics.median(times):.2f}s, p90 {sorted(times)[int(len(times) * 0.9) - 1]:.2f}s."
       if times else "No pages fetched.")
     w("")
@@ -470,7 +499,10 @@ def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=Fa
               if not md else f"{i}. **{code}** ({n}) — {FIX_HINTS.get(code, code)}")
         w("")
     if not counts:
-        w("No issues found — clean crawl." if not md else "_No issues found — clean crawl._")
+        if results:
+            w("No issues found — clean crawl." if not md else "_No issues found — clean crawl._")
+        else:
+            w("Nothing was crawled — no verdict." if not md else "_Nothing was crawled — no verdict._")
     return "\n".join(lines)
 
 
@@ -478,9 +510,12 @@ def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=Fa
 def main():
     ap = argparse.ArgumentParser(description="Streamlined technical SEO audit from a sitemap.")
     ap.add_argument("url", help="Sitemap URL or site root (https://example.com)")
-    ap.add_argument("--max-pages", type=int, default=100, help="Max pages to crawl (default 100)")
+    ap.add_argument("--max-pages", type=int, default=100,
+                    help="Max pages to crawl (default 100; 0 = crawl the whole sitemap)")
     ap.add_argument("--workers", type=int, default=8, help="Concurrent fetches (default 8)")
     ap.add_argument("--delay", type=float, default=0.0, help="Per-worker delay between fetches (s)")
+    ap.add_argument("--time-budget", type=float, default=0, metavar="SECONDS",
+                    help="Stop starting new fetches after this many seconds (0 = no limit)")
     ap.add_argument("--markdown", metavar="FILE", help="Also write the report as markdown")
     ap.add_argument("--json", metavar="FILE", help="Also dump raw results as JSON")
     ap.add_argument("--quiet", action="store_true", help="Suppress progress output")
@@ -497,7 +532,7 @@ def main():
         print(f"error: no sitemap URLs found for {base} (tried: {', '.join(sitemaps)})", file=sys.stderr)
         sys.exit(1)
 
-    sampled = len(page_urls) > args.max_pages
+    sampled = args.max_pages > 0 and len(page_urls) > args.max_pages
     targets = page_urls
     if sampled:
         step = len(page_urls) / args.max_pages
@@ -505,13 +540,17 @@ def main():
     log(f"Crawling {len(targets)} of {len(page_urls)} URLs with {args.workers} workers ...")
 
     results = []
+    deadline = start + args.time_budget if args.time_budget else None
 
     def worker(u):
+        if deadline and time.monotonic() > deadline:
+            return None
         if args.delay:
             time.sleep(args.delay)
-        r = fetch(u)
+        r = fetch_with_retry(u)
         return audit_page(r), r
 
+    skipped = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = {ex.submit(worker, u): u for u in targets}
         done = 0
@@ -520,13 +559,19 @@ def main():
             if done % 25 == 0:
                 log(f"  {done}/{len(targets)}")
             try:
-                (issues, data), raw = fut.result()
+                res = fut.result()
+                if res is None:
+                    skipped += 1
+                    continue
+                (issues, data), raw = res
                 results.append((raw, (issues, data)))
             except Exception as e:
                 u = futures[fut]
                 results.append(({"url": u, "status": None, "error": str(e), "elapsed": 0,
                                  "chain": [], "headers": {}, "body": b"", "final_url": u},
                                 ([(CRITICAL, "fetch-failed", str(e))], {"url": u})))
+    if skipped:
+        log(f"  time budget reached — {skipped} of {len(targets)} URLs not crawled")
 
     # group issues by code
     grouped = defaultdict(list)   # code -> [(sev, url, detail)]
@@ -540,11 +585,11 @@ def main():
 
     elapsed = time.monotonic() - start
     fetch_results = [(raw, None) for raw, _ in results]
-    print(build_report(base, page_urls, sampled, fetch_results, grouped, elapsed, tty=tty))
+    print(build_report(base, page_urls, sampled, fetch_results, grouped, elapsed, tty=tty, skipped=skipped))
 
     if args.markdown:
         with open(args.markdown, "w") as f:
-            f.write(build_report(base, page_urls, sampled, fetch_results, grouped, elapsed, md=True) + "\n")
+            f.write(build_report(base, page_urls, sampled, fetch_results, grouped, elapsed, md=True, skipped=skipped) + "\n")
         log(f"markdown report -> {args.markdown}")
     if args.json:
         with open(args.json, "w") as f:

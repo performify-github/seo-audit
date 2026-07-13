@@ -17,12 +17,18 @@ python3 seo_audit.py https://example.com --markdown report.md --json raw.json
 
 | Flag | Default | |
 |---|---|---|
-| `--max-pages` | 100 | Evenly spaced sample across the sitemap if it's larger |
+| `--max-pages` | 100 | Evenly spaced sample across the sitemap if it's larger; `0` = crawl everything |
 | `--workers` | 8 | Concurrent fetches |
 | `--delay` | 0 | Per-worker politeness delay (s) — use `--workers 2 --delay 0.5` on fragile origins |
+| `--time-budget SECONDS` | 0 (off) | Stop starting new fetches after this long; the report states how many URLs were skipped |
 | `--markdown FILE` | — | Also write the report as markdown |
 | `--json FILE` | — | Dump raw page data + issues as JSON |
 | `--quiet` | — | Suppress progress output |
+
+Rate limiting: 429/503 responses are retried with backoff (honouring `Retry-After`).
+Pages still throttled after retries are reported as **rate-limited (NOT audited)** — a
+crawl-coverage warning, never as broken pages. Shopify storefronts throttle aggressively;
+use `--workers 2 --delay 1` there.
 
 Exit code `0` = clean or warnings only, `2` = critical issues found — usable in CI or a
 cron health check.
