@@ -22,6 +22,8 @@ python3 seo_audit.py https://example.com --markdown report.md --json raw.json
 | `--workers` | 8 | Concurrent fetches |
 | `--delay` | 0 | Per-worker politeness delay (s) — use `--workers 2 --delay 0.5` on fragile origins |
 | `--time-budget SECONDS` | 0 (off) | Stop starting new fetches after this long; the report states how many URLs were skipped |
+| `--check-links` | off | Also verify internal link targets that are **not** in the sitemap (capped at 50 extra fetches, most-linked first) |
+| `--explain-scores` | off | Show the score arithmetic and internal issue codes in the report |
 | `--markdown FILE` | — | Also write the report as markdown |
 | `--json FILE` | — | Dump verdict, coverage, ranking, page data + issues as JSON |
 | `--quiet` | — | Suppress progress output |
@@ -47,27 +49,45 @@ OBSERVATIONS               context only, one line each
 
 ### The four issue classes
 
-- **Indexation blockers** — pages cannot or should not be indexed: sitemap 4xx/5xx,
-  fetch failures, noindex-in-sitemap, redirect loops, robots.txt blanket disallow,
-  sitemap URLs blocked by robots.txt, missing `<title>`, mixed content.
+- **Indexation blockers** — pages cannot be crawled, indexed, or reached: sitemap
+  4xx/5xx, fetch failures, noindex-in-sitemap, redirect loops, sitemap URLs blocked
+  from Googlebot by robots.txt, a robots.txt that blocks Googlebot from effectively
+  the whole site. Reserved strictly for indexation — a flawed-but-indexable page never
+  lands here.
 - **Material issues** — likely to affect discovery, consolidation, or presentation:
-  redirected sitemap URLs, duplicate titles/descriptions, canonical problems (including
-  broken/redirecting/noindexed canonical targets), internal links to 4xx/5xx pages,
-  rate-limited coverage gaps, no http→https redirect.
-- **Opportunities** — worth reviewing, phrased as review-not-fix: missing meta
-  description / H1 / self-canonical, title & description length, thin visible text,
-  slow-fetch outliers, internal links to redirects or noindexed pages, orphan pages.
+  missing `<title>`, mixed content, redirected sitemap URLs, duplicate titles,
+  canonical problems (including broken/redirecting/noindexed canonical targets),
+  internal links to 4xx/5xx pages, rate-limited coverage gaps, no http→https redirect.
+- **Opportunities** — worth reviewing, phrased as review-not-fix: missing or shared
+  meta descriptions, missing H1 / self-canonical, title & description length, thin
+  visible text, slow-fetch outliers, internal links to redirects or noindexed pages,
+  orphan pages.
 - **Observations** — context only: multiple H1s, no structured data, missing viewport,
   large HTML, non-HTML sitemap entries, images without alt, cross-domain canonicals,
-  many-to-one canonical consolidation.
+  many-to-one canonical consolidation, robots.txt blocking the audit UA (a coverage
+  caveat, never an SEO finding).
+
+### robots.txt handling
+
+Assessment uses `urllib.robotparser` per user-agent group — never line-grepping, so
+`Disallow: /` inside some other bot's group is not misread as a site block. What
+matters for indexation is **Googlebot**: sitemap URLs Googlebot can't fetch are
+blockers, and "site blocked" is derived only when Googlebot is blocked from the
+homepage **and** ≥95% of sitemap URLs. The audit UA being blocked is reported
+separately as an observation ("audit coverage may be limited").
 
 ### Priority scoring (transparent by design)
 
 Every issue code has a static `(impact 1–5, confidence 1–5)` entry in the `IMPACT`
 table in the source. **score = impact × confidence × affected_fraction**, where
-affected_fraction = affected URLs / crawled pages (capped at 1). The report prints the
-inputs with every priority action — e.g. `score 4.0 = impact 5 × confidence 5 × 8/50
-affected` — so any ranking can be recomputed by hand. No opaque logic.
+affected_fraction = **affected crawled pages** / crawled pages (capped at 1). Scope is
+what matters: a site-wide issue (robots block, missing https redirect) counts as every
+crawled page, and a single broken canonical target or nav link counts as all the pages
+that use it — one technical URL never dilutes a widespread problem down to 1/N.
+
+The default report shows plain language ("high impact, high confidence — affects 37 of
+100 crawled pages"); `--explain-scores` (and the JSON output) exposes the full
+arithmetic and issue codes so any ranking can be recomputed by hand. No opaque logic.
 
 ### Pattern clustering
 
@@ -86,9 +106,11 @@ flattered.
 ### Internal-link graph
 
 Every `<a href>` is kept, resolved, and filtered to internal links, giving inlink
-counts across the crawl with **zero extra requests**: internal links to 4xx/5xx pages,
-to redirects, to noindexed pages, and to canonicalised-away pages are all checked
-against pages already crawled.
+counts across the crawl with **zero extra requests** by default: internal links to
+4xx/5xx pages, to redirects, to noindexed pages, and to canonicalised-away pages are
+all checked against pages already crawled. Off-sitemap link targets — where broken
+internal links usually live — are not judged by default; `--check-links` verifies up
+to 50 of them concurrently, most-linked first.
 
 **Orphan rule:** orphan detection (sitemap URLs with zero inlinks) is only
 statistically valid when the crawl saw enough of the site. It is reported **only at
@@ -97,9 +119,18 @@ with an orphan claim.
 
 ### Canonical target validation
 
-Canonicals pointing outside the crawl set are deduped and at most 50 are fetched:
-targets that don't return 200, redirect, or are noindexed are material issues;
-cross-domain canonicals and many-pages-to-one-destination are observations.
+Canonicals pointing outside the crawl set are deduped and at most 20 are fetched
+(concurrently, most-used targets first, honouring `--time-budget`): targets that
+don't return 200, redirect, or are noindexed are material issues; cross-domain
+canonicals and many-pages-to-one-destination are observations. A rate-limited target
+is left **unverified** — never reported as broken.
+
+### Duplicate detection
+
+Duplicate titles/descriptions are compared only across indexable pages: 200, HTML,
+not redirected, not noindexed, and self-canonical. A redirected sitemap URL parsing
+its destination's metadata, or pages deliberately consolidating via canonicals, never
+manufacture duplicates.
 
 ## How it works
 

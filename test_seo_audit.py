@@ -142,6 +142,13 @@ class TestClasses(unittest.TestCase):
         self.assertEqual(cm.get("redirected-sitemap-url"), sa.MATERIAL)
         self.assertEqual(cm.get("duplicate-title"), sa.MATERIAL)
 
+    def test_blocker_class_reserved_for_indexation(self):
+        # crawlable-but-flawed pages are material, not blockers
+        self.assertEqual(sa.CLASS_OF["missing-title"], sa.MATERIAL)
+        self.assertEqual(sa.CLASS_OF["mixed-content"], sa.MATERIAL)
+        self.assertEqual(sa.CLASS_OF["duplicate-description"], sa.OPPORTUNITY)
+        self.assertFalse(sa.has_blockers({"missing-title": [(sa.MATERIAL, "u", None)]}))
+
     def test_opportunities(self):
         cm = classes_of(self.grouped)
         self.assertEqual(cm.get("missing-description"), sa.OPPORTUNITY)
@@ -149,6 +156,24 @@ class TestClasses(unittest.TestCase):
     def test_observations(self):
         cm = classes_of(self.grouped)
         self.assertEqual(cm.get("multiple-h1"), sa.OBSERVATION)
+
+    def test_duplicates_only_across_indexable_pages(self):
+        # /redirected parses /about's title but must not create a duplicate;
+        # noindexed pages are excluded too
+        urls = {u for _, u, _ in self.grouped.get("duplicate-title", [])}
+        base = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        self.assertEqual(urls, {f"{base}/dup-a", f"{base}/dup-b"})
+
+    def test_coverage_categories_exclusive(self):
+        cov = self.model["coverage"]
+        self.assertEqual(cov["crawled"], 9)
+        self.assertEqual(cov["broken"], 1)
+        self.assertEqual(cov["noindexed"], 1)
+        self.assertEqual(cov["redirected"], 1)
+        self.assertEqual(cov["indexable_html"], 6)   # redirected page NOT double-counted
+        total = (cov["broken"] + cov["noindexed"] + cov["redirected"]
+                 + cov["indexable_html"] + cov["rate_limited"] + cov["unreachable"])
+        self.assertEqual(total, cov["crawled"])
 
     def test_no_fixed_slow_threshold(self):
         self.assertNotIn("slow-response", self.grouped)
@@ -235,7 +260,7 @@ class TestRankingAndVerdict(unittest.TestCase):
         crawled = len(self.model["results"])
         for e in self.model["ranked"]:
             imp, conf = sa.IMPACT.get(e["code"], (1, 1))
-            expected = round(imp * conf * min(1.0, e["n"] / crawled), 2)
+            expected = round(imp * conf * min(1.0, e["affected"] / crawled), 2)
             self.assertEqual(e["score"], expected, e["code"])
 
     def test_top_priority_is_http_error(self):
@@ -267,8 +292,17 @@ class TestRankingAndVerdict(unittest.TestCase):
         report = sa.build_report(self.model, md=True)
         for section in ("## Verdict", "## Coverage", "## Priority actions"):
             self.assertIn(section, report)
-        self.assertIn("score", report)
+        # default report: human labels and plain-language scoring, no mechanics
+        self.assertIn("Broken sitemap URLs (4xx/5xx)", report)
+        self.assertIn("high impact, high confidence", report)
+        self.assertIn("affects 4 of 8 crawled pages", report)
+        self.assertNotIn("impact 5 x confidence 5", report)
+        self.assertNotIn("[http-error]", report)
+
+    def test_explain_scores_mode(self):
+        report = sa.build_report(self.model, md=True, explain=True)
         self.assertIn("impact 5 x confidence 5", report)
+        self.assertIn("[http-error]", report)
 
     def test_coverage_stats(self):
         cov = self.model["coverage"]
@@ -401,7 +435,8 @@ class TestCanonicalTargets(unittest.TestCase):
         cls.srv = make_server(routes)
         base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         cls.base = base
-        cpages = [f"{base}/c1", f"{base}/c2", f"{base}/c3", f"{base}/c4", f"{base}/c5"]
+        cpages = [f"{base}/c1", f"{base}/c2", f"{base}/c3", f"{base}/c4", f"{base}/c5",
+                  f"{base}/c6"]
         kpages = [f"{base}/k{i}" for i in range(5)]
         routes.update({
             "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
@@ -416,6 +451,8 @@ class TestCanonicalTargets(unittest.TestCase):
                                          canonical=f"{base}/noindex-target")),
             "/c5": (200, HTML, html_page(title="C5 page title of the fixture site ok",
                                          canonical="https://syndication.example/article")),
+            "/c6": (200, HTML, html_page(title="C6 page title of the fixture site ok",
+                                         canonical=f"{base}/throttled-target")),
             "/good-target": (200, HTML, html_page(title="Good canonical target title fixture",
                                                   canonical=f"{base}/good-target")),
             # /dead-target is unrouted -> 404
@@ -423,6 +460,7 @@ class TestCanonicalTargets(unittest.TestCase):
             "/noindex-target": (200, HTML, html_page(title="Noindex canonical target title ok",
                                                      noindex=True,
                                                      canonical=f"{base}/noindex-target")),
+            "/throttled-target": (429, {"Retry-After": "0", **HTML}, b""),
         })
         # five more pages all canonicalising to one destination -> consolidation
         for i in range(5):
@@ -463,6 +501,50 @@ class TestCanonicalTargets(unittest.TestCase):
         self.assertEqual([u for _, u, _ in items], [f"{self.base}/good-target"])
         self.assertIn("6 crawled pages", items[0][2])
 
+    def test_rate_limited_target_is_unverified_not_broken(self):
+        self.assertNotIn(f"{self.base}/throttled-target", self._urls("canonical-target-broken"))
+
+    def test_broken_target_scope_is_source_pages(self):
+        entry = next(e for e in self.model["ranked"] if e["code"] == "canonical-target-broken")
+        self.assertEqual((entry["n"], entry["affected"]), (1, 1))
+
+
+class TestCheckLinks(unittest.TestCase):
+    """--check-links verifies off-sitemap internal destinations; default doesn't."""
+
+    @classmethod
+    def setUpClass(cls):
+        routes = {}
+        cls.srv = make_server(routes)
+        base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.base = base
+        pages = [f"{base}/", f"{base}/present"]
+        routes.update({
+            "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+            "/sitemap.xml": (200, XML, sitemap_xml(pages)),
+            "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                       canonical=f"{base}/",
+                                       links=[f"{base}/present", f"{base}/ghost"])),
+            "/present": (200, HTML, html_page(title="Present page title of the fixture ok",
+                                              canonical=f"{base}/present", links=[f"{base}/"])),
+            # /ghost is unrouted -> 404, and not in the sitemap
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def test_default_skips_off_sitemap_targets(self):
+        model = sa.run_audit(f"{self.base}/sitemap.xml", max_pages=0, workers=4)
+        self.assertNotIn("internal-link-broken", model["grouped"])
+
+    def test_check_links_finds_off_sitemap_404(self):
+        model = sa.run_audit(f"{self.base}/sitemap.xml", max_pages=0, workers=4,
+                             check_links=True)
+        urls = [u for _, u, _ in model["grouped"].get("internal-link-broken", [])]
+        self.assertEqual(urls, [f"{self.base}/ghost"])
+        self.assertIn("not in sitemap", model["grouped"]["internal-link-broken"][0][2])
+
 
 class TestRobotsValidation(unittest.TestCase):
     """Sitemap-listed-but-robots-blocked URLs are indexation blockers."""
@@ -502,6 +584,51 @@ class TestRobotsValidation(unittest.TestCase):
     def test_unblocked_site_clean(self):
         base, model = self._run("User-agent: *\nAllow: /\n")
         self.assertNotIn("robots-blocked-sitemap-url", model["grouped"])
+
+    def test_other_bot_blanket_is_not_a_site_block(self):
+        # Disallow: / in ANOTHER bot's group must not read as blocking the site
+        base, model = self._run(
+            "User-agent: some-other-bot\nDisallow: /\n\nUser-agent: *\nAllow: /\n")
+        self.assertNotIn("robots-blocks-all", model["grouped"])
+        self.assertNotIn("robots-blocked-sitemap-url", model["grouped"])
+        self.assertFalse(sa.has_blockers(model["grouped"]))
+
+    def test_audit_ua_block_is_coverage_note_not_blocker(self):
+        base, model = self._run("User-agent: performify-seo-audit\nDisallow: /\n"
+                                "\nUser-agent: *\nAllow: /\n")
+        self.assertNotIn("robots-blocks-all", model["grouped"])
+        self.assertNotIn("robots-blocked-sitemap-url", model["grouped"])
+        items = model["grouped"].get("robots-blocks-audit-ua", [])
+        self.assertTrue(items)
+        self.assertEqual(items[0][0], sa.OBSERVATION)
+        self.assertFalse(sa.has_blockers(model["grouped"]))
+
+    def test_site_block_derived_and_ranked_sitewide(self):
+        base, model = self._run("User-agent: *\nDisallow: /\n")
+        top = [e for e in model["ranked"] if e["class"] in (sa.BLOCKER, sa.MATERIAL)][0]
+        self.assertEqual(top["code"], "robots-blocks-all")
+        # one technical URL, but scope = every crawled page
+        self.assertEqual(top["affected"], len(model["results"]))
+        self.assertEqual(top["score"], 25.0)
+
+
+class TestRankingScope(unittest.TestCase):
+    def test_sitewide_outranks_page_level(self):
+        grouped = {
+            "robots-blocks-all": [(sa.BLOCKER, "https://x/robots.txt", None)],
+            "missing-title": [(sa.MATERIAL, f"https://x/p{i}", None) for i in range(10)],
+        }
+        ranked = sa.rank_issues(grouped, 100, {"robots-blocks-all": 100})
+        self.assertEqual(ranked[0]["code"], "robots-blocks-all")
+        self.assertEqual(ranked[0]["score"], 25.0)     # 5 x 5 x 100/100
+        self.assertEqual(ranked[1]["score"], 2.0)      # 4 x 5 x 10/100
+
+    def test_shared_target_scope_uses_source_pages(self):
+        grouped = {"canonical-target-broken": [(sa.MATERIAL, "https://x/dead", None)]}
+        ranked = sa.rank_issues(grouped, 100, {"canonical-target-broken": 37})
+        self.assertEqual(ranked[0]["n"], 1)
+        self.assertEqual(ranked[0]["affected"], 37)
+        self.assertEqual(ranked[0]["score"], round(4 * 4 * 0.37, 2))
 
 
 # ---------------------------------------------------------------- timing outliers

@@ -48,19 +48,19 @@ CLASS_LABELS = {
 }
 
 CLASS_OF = {
-    # indexation blockers
+    # indexation blockers — reserved for "cannot be crawled/indexed/consolidated"
     "http-error": BLOCKER,
     "fetch-failed": BLOCKER,
     "noindex-in-sitemap": BLOCKER,
     "redirect-problem": BLOCKER,
     "robots-blocks-all": BLOCKER,
     "robots-blocked-sitemap-url": BLOCKER,
-    "missing-title": BLOCKER,
-    "mixed-content": BLOCKER,
-    # material issues
+    # material issues (a page without a title or with mixed content still
+    # gets crawled and indexed — serious, but not a blocker)
+    "missing-title": MATERIAL,
+    "mixed-content": MATERIAL,
     "redirected-sitemap-url": MATERIAL,
     "duplicate-title": MATERIAL,
-    "duplicate-description": MATERIAL,
     "canonical-mismatch": MATERIAL,
     "canonical-target-broken": MATERIAL,
     "canonical-target-redirects": MATERIAL,
@@ -69,6 +69,7 @@ CLASS_OF = {
     "rate-limited": MATERIAL,
     "no-https-redirect": MATERIAL,
     # opportunities
+    "duplicate-description": OPPORTUNITY,
     "missing-description": OPPORTUNITY,
     "missing-h1": OPPORTUNITY,
     "title-length": OPPORTUNITY,
@@ -91,22 +92,27 @@ CLASS_OF = {
     "internal-link-canonicalised": OBSERVATION,
     "cross-domain-canonical": OBSERVATION,
     "canonical-consolidation": OBSERVATION,
+    "robots-blocks-audit-ua": OBSERVATION,
 }
+
+# issues whose subject is one technical URL but whose scope is the whole site —
+# ranked with affected = every crawled page, not 1/crawled
+SITE_WIDE = {"robots-blocks-all", "no-https-redirect", "robots-missing",
+             "robots-no-sitemap", "robots-blocks-audit-ua"}
 
 FIX_HINTS = {
     # blockers — direct fix language
     "http-error": "Remove dead URLs from the sitemap or restore the pages (a sitemap must only list 200s).",
     "fetch-failed": "Check DNS/TLS/WAF — the crawler could not fetch these at all; Googlebot may be failing too.",
     "noindex-in-sitemap": "A noindexed URL in the sitemap sends Google contradictory signals — drop it from the sitemap or remove the noindex.",
+    "redirect-problem": "Redirect loops or chains beyond 5 hops mean the page cannot be reached or indexed.",
+    "robots-blocks-all": "robots.txt blocks Googlebot from the homepage and essentially every sitemap URL — the site cannot be crawled.",
+    "robots-blocked-sitemap-url": "These URLs are listed in the sitemap but robots.txt blocks Googlebot — contradictory signals; unblock them or drop them from the sitemap.",
+    # material — direct but measured
     "missing-title": "Every indexable page needs a unique <title>; it is the single strongest on-page relevance signal.",
     "mixed-content": "Load all subresources over https — browsers block or warn, and it erodes trust signals.",
-    "redirect-problem": "Redirect loops or chains beyond 5 hops mean the page cannot be reached or indexed.",
-    "robots-blocks-all": "robots.txt disallows everything — the site cannot be crawled.",
-    "robots-blocked-sitemap-url": "These URLs are listed in the sitemap but blocked by robots.txt — contradictory signals; unblock them or drop them from the sitemap.",
-    # material — direct but measured
     "redirected-sitemap-url": "Sitemaps should list final URLs, not redirects — update the sitemap generator.",
     "duplicate-title": "Duplicate titles make pages compete with each other; differentiate or canonicalise.",
-    "duplicate-description": "Duplicate meta descriptions blur which page should surface; write per-page or omit and let Google generate.",
     "canonical-mismatch": "Page canonicalises elsewhere but sits in the sitemap — pick one: fix the canonical or remove from sitemap.",
     "canonical-target-broken": "Canonical points at a URL that does not return 200 — the consolidation signal is being thrown away.",
     "canonical-target-redirects": "Canonical points at a redirecting URL — point it at the final destination instead.",
@@ -115,6 +121,7 @@ FIX_HINTS = {
     "rate-limited": "The origin throttled the crawl (429/503) even after backoff — these pages were NOT audited. Rerun with --workers 2 --delay 1.",
     "no-https-redirect": "http:// version doesn't redirect to https — duplicate-protocol indexing risk.",
     # opportunities — review-not-fix language
+    "duplicate-description": "Several pages share one description — review whether per-page copy is worth writing on key templates; Google generates its own snippets anyway.",
     "missing-description": "No meta description — Google generates the snippet. Review whether hand-written descriptions would present key pages better; not a ranking factor.",
     "missing-h1": "No <h1> found in the raw HTML — review whether the main heading is marked up as one; worth tidying, not urgent.",
     "title-length": "Title length is outside the typical 30-60 char display band — review whether it still describes the page; length alone is not a ranking issue.",
@@ -137,7 +144,60 @@ FIX_HINTS = {
     "internal-link-canonicalised": "Internal links point at pages that canonicalise elsewhere — context; often deliberate (variants, tracking pages).",
     "cross-domain-canonical": "Canonical points at another domain — often deliberate (syndication); verify it is intended.",
     "canonical-consolidation": "Many pages canonicalise to one URL — context; verify the consolidation is intended.",
+    "robots-blocks-audit-ua": "robots.txt blocks this audit's crawler but not Googlebot — no SEO impact; the origin may treat unknown bots differently, so audit coverage could be limited.",
 }
+
+# human labels for the default report (codes stay in JSON / --explain-scores)
+ISSUE_LABELS = {
+    "http-error": "Broken sitemap URLs (4xx/5xx)",
+    "fetch-failed": "Unreachable sitemap URLs",
+    "noindex-in-sitemap": "Noindexed pages in the sitemap",
+    "redirect-problem": "Redirect loops / over-long chains",
+    "robots-blocks-all": "robots.txt blocks the whole site",
+    "robots-blocked-sitemap-url": "Sitemap URLs blocked by robots.txt",
+    "missing-title": "Pages with no <title>",
+    "mixed-content": "Mixed content on https pages",
+    "redirected-sitemap-url": "Sitemap URLs that redirect",
+    "duplicate-title": "Duplicate titles",
+    "duplicate-description": "Shared meta descriptions",
+    "canonical-mismatch": "Pages canonicalising elsewhere",
+    "canonical-target-broken": "Broken canonical targets",
+    "canonical-target-redirects": "Canonical targets that redirect",
+    "canonical-target-noindex": "Noindexed canonical targets",
+    "internal-link-broken": "Internal links to broken pages",
+    "rate-limited": "Rate-limited (not audited)",
+    "no-https-redirect": "No http-to-https redirect",
+    "missing-description": "Missing meta descriptions",
+    "missing-h1": "Pages without an <h1>",
+    "title-length": "Titles outside the display band",
+    "description-length": "Descriptions outside the display band",
+    "thin-content": "Little visible text",
+    "missing-canonical": "No self-canonical",
+    "slow-fetch-outlier": "Slow-fetch outliers",
+    "robots-missing": "No robots.txt",
+    "internal-link-redirect": "Internal links via redirects",
+    "internal-link-noindex": "Internal links to noindexed pages",
+    "orphan-page": "Sitemap URLs with no internal links",
+    "multiple-h1": "Multiple <h1>s",
+    "no-structured-data": "No JSON-LD structured data",
+    "missing-viewport": "No viewport meta",
+    "large-html": "HTML over 300KB",
+    "non-html": "Non-HTML sitemap entries",
+    "images-missing-alt": "Images without alt attributes",
+    "robots-no-sitemap": "robots.txt without a Sitemap line",
+    "internal-link-canonicalised": "Internal links to canonicalised-away pages",
+    "cross-domain-canonical": "Cross-domain canonicals",
+    "canonical-consolidation": "Many pages canonicalising to one URL",
+    "robots-blocks-audit-ua": "robots.txt blocks the audit crawler",
+}
+
+
+def label(code):
+    return ISSUE_LABELS.get(code, code)
+
+
+def level_word(x):
+    return "high" if x >= 4 else "medium" if x == 3 else "low"
 
 
 def issue(code, detail=None):
@@ -176,7 +236,7 @@ IMPACT = {
     "thin-content": (2, 2),
     "missing-canonical": (2, 2),
     "slow-fetch-outlier": (2, 2),
-    "robots-missing": (2, 3),
+    "robots-missing": (1, 2),   # site-wide scope (fraction 1.0) already weights it
     "internal-link-redirect": (2, 3),
     "internal-link-noindex": (2, 3),
     "orphan-page": (3, 2),
@@ -222,17 +282,24 @@ def phrase(code, n):
     return tpl.format(n=n, s=s) if tpl else f"{n} URL{s} with {code}"
 
 
-def rank_issues(grouped, n_crawled):
-    """Score every issue group. Returns dicts sorted by score desc."""
+def rank_issues(grouped, n_crawled, affected_pages=None):
+    """Score every issue group. Returns dicts sorted by score desc.
+
+    affected_pages overrides the scope per code: for issues whose subject is
+    one technical URL (a sitewide robots block, a canonical target shared by
+    37 pages) the scope is the crawled pages affected, not the issue-URL count.
+    """
+    affected_pages = affected_pages or {}
     ranked = []
     for code, items in grouped.items():
         if not items:
             continue
         cls = items[0][0]
         urls = list(dict.fromkeys(u for _, u, _ in items))
+        affected = affected_pages.get(code, len(urls))
         imp, conf = IMPACT.get(code, (1, 1))
-        frac = min(1.0, len(urls) / n_crawled) if n_crawled else 0.0
-        ranked.append({"code": code, "class": cls, "n": len(urls),
+        frac = min(1.0, affected / n_crawled) if n_crawled else 0.0
+        ranked.append({"code": code, "class": cls, "n": len(urls), "affected": affected,
                        "impact": imp, "confidence": conf, "fraction": round(frac, 3),
                        "score": round(imp * conf * frac, 2)})
     ranked.sort(key=lambda e: (-e["score"], CLASS_ORDER.index(e["class"]), e["code"]))
@@ -653,6 +720,7 @@ def audit_page(result):
         "canonical_abs": canon_abs,
         "links": p.links,
         "final_url": result["final_url"],
+        "redirected": bool(result["chain"]),
         "html": True,
         "jsonld_types": sorted({d.get("@type") for d in p.jsonld
                                 if isinstance(d, dict) and isinstance(d.get("@type"), str)}),
@@ -686,9 +754,8 @@ def _strip_www(netloc):
 
 
 def build_link_graph(results, base_netloc):
-    """Index crawled pages by normalised URL and count internal inlinks.
-
-    Each target is counted once per linking page; self-links are ignored.
+    """Index crawled pages by normalised URL and collect internal inlink
+    sources: target -> set of linking page URLs. Self-links are ignored.
     Built entirely from the crawl — no new requests.
     """
     index = {}
@@ -697,57 +764,62 @@ def build_link_graph(results, base_netloc):
         index.setdefault(norm_url(r["url"]), (r, data))
     for r, (_, data) in results:
         index.setdefault(norm_url(r.get("final_url") or r["url"]), (r, data))
-    inlinks = Counter()
+    inlink_sources = defaultdict(set)
     base_host = _strip_www(base_netloc)
     for r, (_, data) in results:
         src_final = r.get("final_url") or r["url"]
-        seen = set()
         for href in data.get("links") or []:
             absu = urllib.parse.urljoin(src_final, href)
             sp = urllib.parse.urlsplit(absu)
             if sp.scheme not in ("http", "https") or _strip_www(sp.netloc) != base_host:
                 continue
             t = norm_url(absu)
-            if t in seen or t in (norm_url(src_final), norm_url(r["url"])):
+            if t in (norm_url(src_final), norm_url(r["url"])):
                 continue
-            seen.add(t)
-            inlinks[t] += 1
-    return index, inlinks
+            inlink_sources[t].add(r["url"])
+    return index, inlink_sources
 
 
-def link_checks(index, inlinks):
+def link_checks(index, inlink_sources):
     """Internal links -> broken / redirected / noindexed / canonicalised-away
-    targets. Only judges targets that were crawled — zero extra requests."""
+    targets. Only judges targets that were crawled — zero extra requests.
+
+    Returns (issues, sources_by_code) — the latter is the set of linking pages
+    per code, which is the real scope of the problem for ranking.
+    """
     issues = defaultdict(list)
+    sources_by_code = defaultdict(set)
 
-    def add(code, url, detail):
+    def add(code, url, detail, sources):
         issues[code].append((CLASS_OF[code], url, detail))
+        sources_by_code[code].update(sources)
 
-    for target, n in inlinks.items():
+    for target, sources in inlink_sources.items():
         entry = index.get(target)
         if entry is None:
             continue
         r, data = entry
+        n = len(sources)
         linked = f"linked from {n} crawled page{'s' if n != 1 else ''}"
         if r["error"]:
-            add("internal-link-broken", r["url"], f"{linked} — {r['error']}")
+            add("internal-link-broken", r["url"], f"{linked} — {r['error']}", sources)
         elif r["status"] in RATE_LIMIT_STATUSES:
             continue  # coverage gap, already reported; can't judge the target
         elif r["status"] >= 400:
-            add("internal-link-broken", r["url"], f"{linked} — HTTP {r['status']}")
+            add("internal-link-broken", r["url"], f"{linked} — HTTP {r['status']}", sources)
         elif r["chain"] and target == norm_url(r["url"]):
             # the link hits the redirecting URL itself, not its destination
-            add("internal-link-redirect", r["url"], f"{linked} — -> {r['final_url']}")
+            add("internal-link-redirect", r["url"], f"{linked} — -> {r['final_url']}", sources)
         elif data.get("noindex"):
-            add("internal-link-noindex", r["url"], linked)
+            add("internal-link-noindex", r["url"], linked, sources)
         elif data.get("canonical_abs") and \
                 norm_url(data["canonical_abs"]) != norm_url(r.get("final_url") or r["url"]):
             add("internal-link-canonicalised", r["url"],
-                f"{linked} — canonicalises to {data['canonical_abs']}")
-    return issues
+                f"{linked} — canonicalises to {data['canonical_abs']}", sources)
+    return issues, sources_by_code
 
 
-def orphan_checks(page_urls, results, inlinks):
+def orphan_checks(page_urls, results, inlink_sources):
     """Sitemap URLs with zero internal inlinks across the crawl.
 
     Only statistically valid at high coverage: with a sampled crawl, "no
@@ -759,21 +831,27 @@ def orphan_checks(page_urls, results, inlinks):
         return {}
     issues = defaultdict(list)
     for r, (_, data) in results:
-        if r["error"] or not data.get("html") or r["status"] >= 400 or data.get("noindex"):
+        if r["error"] or not data.get("html") or r["status"] >= 400 \
+                or r["chain"] or data.get("noindex"):
             continue
         if urllib.parse.urlparse(r["url"]).path in ("", "/"):
             continue  # the homepage needs no inlinks
         norms = {norm_url(r["url"]), norm_url(r.get("final_url") or r["url"])}
-        if not any(inlinks.get(nu, 0) for nu in norms):
+        if not any(inlink_sources.get(nu) for nu in norms):
             issues["orphan-page"].append((CLASS_OF["orphan-page"], r["url"],
                                           "no internal links found in the crawl"))
     return issues
 
 
 def _judge_canonical_target(r, noindex, sources):
-    """Classify one canonical target from its fetch result. Returns (code, detail) or None."""
+    """Classify one canonical target from its fetch result. Returns (code, detail) or None.
+
+    A rate-limited target is UNVERIFIED, never broken — the origin said "not
+    now", not "gone"."""
     n = len(sources)
     for_pages = f"canonical for {n} crawled page{'s' if n != 1 else ''}"
+    if r["status"] in RATE_LIMIT_STATUSES:
+        return None
     if r["error"]:
         return "canonical-target-broken", f"{r['error']} — {for_pages}"
     if r["status"] >= 400:
@@ -785,10 +863,15 @@ def _judge_canonical_target(r, noindex, sources):
     return None
 
 
-def canonical_target_checks(results, index, base_netloc, log, max_fetch=50):
+def canonical_target_checks(results, index, base_netloc, log, max_fetch=20,
+                            workers=4, deadline=None):
     """Validate where canonicals point. Crawled targets are judged from crawl
-    data; at most max_fetch deduped out-of-crawl targets get fetched."""
+    data; at most max_fetch deduped out-of-crawl targets get fetched
+    concurrently, most-used targets first, honouring any time budget.
+
+    Returns (issues, sources_by_code) — the linking scope per code."""
     issues = defaultdict(list)
+    sources_by_code = defaultdict(set)
     base_host = _strip_www(base_netloc)
     targets = {}   # norm target -> {"url": abs url, "sources": [page urls]}
     for r, (_, data) in results:
@@ -798,28 +881,37 @@ def canonical_target_checks(results, index, base_netloc, log, max_fetch=50):
         t = targets.setdefault(norm_url(canon), {"url": canon, "sources": []})
         t["sources"].append(r["url"])
 
+    def add(code, url, detail, sources):
+        issues[code].append((CLASS_OF[code], url, detail))
+        sources_by_code[code].update(sources)
+
     to_fetch = []
     for nt, t in targets.items():
         if len(t["sources"]) >= 5:
-            issues["canonical-consolidation"].append(
-                (CLASS_OF["canonical-consolidation"], t["url"],
-                 f"{len(t['sources'])} crawled pages canonicalise here"))
+            add("canonical-consolidation", t["url"],
+                f"{len(t['sources'])} crawled pages canonicalise here", t["sources"])
         if _strip_www(urllib.parse.urlsplit(t["url"]).netloc) != base_host:
             for src in t["sources"]:
-                issues["cross-domain-canonical"].append(
-                    (CLASS_OF["cross-domain-canonical"], src, f"-> {t['url']}"))
+                add("cross-domain-canonical", src, f"-> {t['url']}", [src])
             continue
         if nt in index:
             r, data = index[nt]
             verdict = _judge_canonical_target(r, data.get("noindex"), t["sources"])
             if verdict:
-                issues[verdict[0]].append((CLASS_OF[verdict[0]], t["url"], verdict[1]))
+                add(verdict[0], t["url"], verdict[1], t["sources"])
         else:
             to_fetch.append(t)
 
+    # most-used targets first; the cap and the time budget bound the extra work
+    to_fetch.sort(key=lambda t: -len(t["sources"]))
     if len(to_fetch) > max_fetch:
-        log(f"  canonical targets: fetching {max_fetch} of {len(to_fetch)} out-of-crawl targets")
-    for t in to_fetch[:max_fetch]:
+        log(f"  canonical targets: verifying {max_fetch} of {len(to_fetch)} "
+            f"out-of-crawl targets (most-used first)")
+    unverified = max(0, len(to_fetch) - max_fetch)
+
+    def verify(t):
+        if deadline and time.monotonic() > deadline:
+            return t, None, None
         r = fetch_with_retry(t["url"])
         noindex = "noindex" in (r["headers"].get("X-Robots-Tag") or "").lower()
         if not noindex and not r["error"] and r["status"] and r["status"] < 400 \
@@ -831,10 +923,55 @@ def canonical_target_checks(results, index, base_netloc, log, max_fetch=50):
             except Exception:
                 pass
             noindex = "noindex" in (p.robots_meta or "")
-        verdict = _judge_canonical_target(r, noindex, t["sources"])
-        if verdict:
-            issues[verdict[0]].append((CLASS_OF[verdict[0]], t["url"], verdict[1]))
-    return issues
+        return t, r, noindex
+
+    if to_fetch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            for t, r, noindex in ex.map(verify, to_fetch[:max_fetch]):
+                if r is None or r["status"] in RATE_LIMIT_STATUSES:
+                    unverified += 1
+                    continue
+                verdict = _judge_canonical_target(r, noindex, t["sources"])
+                if verdict:
+                    add(verdict[0], t["url"], verdict[1], t["sources"])
+    if unverified:
+        log(f"  canonical targets: {unverified} left unverified (cap, rate limit, or time budget)")
+    return issues, sources_by_code
+
+
+def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4, deadline=None):
+    """--check-links: verify internal link targets that are NOT in the crawl
+    set (off-sitemap destinations — where broken internal links usually live).
+    Capped, concurrent, most-linked first. Returns (issues, sources_by_code)."""
+    issues = defaultdict(list)
+    sources_by_code = defaultdict(set)
+    unknown = sorted(((t, srcs) for t, srcs in inlink_sources.items() if t not in index),
+                     key=lambda kv: -len(kv[1]))
+    if len(unknown) > max_fetch:
+        log(f"  link check: verifying {max_fetch} of {len(unknown)} off-sitemap "
+            f"targets (most-linked first)")
+
+    def verify(item):
+        t, srcs = item
+        if deadline and time.monotonic() > deadline:
+            return t, srcs, None
+        return t, srcs, fetch_with_retry(t)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for t, srcs, r in ex.map(verify, unknown[:max_fetch]):
+            if r is None or r["status"] in RATE_LIMIT_STATUSES:
+                continue  # unverified — never report a throttled target as broken
+            n = len(srcs)
+            linked = f"linked from {n} crawled page{'s' if n != 1 else ''}, not in sitemap"
+            if r["error"]:
+                issues["internal-link-broken"].append(
+                    (CLASS_OF["internal-link-broken"], t, f"{linked} — {r['error']}"))
+                sources_by_code["internal-link-broken"].update(srcs)
+            elif r["status"] >= 400:
+                issues["internal-link-broken"].append(
+                    (CLASS_OF["internal-link-broken"], t, f"{linked} — HTTP {r['status']}"))
+                sources_by_code["internal-link-broken"].update(srcs)
+    return issues, sources_by_code
 
 
 def site_checks(base_url, pages, sitemap_urls, log):
@@ -853,22 +990,31 @@ def site_checks(base_url, pages, sitemap_urls, log):
                                          f"HTTP {r['status']}"))
     else:
         body = decode_body(r)
-        blanket = bool(re.search(r"^user-agent:\s*\*\s*$", body, re.I | re.M) and
-                       re.search(r"^disallow:\s*/\s*$", body, re.I | re.M))
-        if blanket:
-            issues["robots-blocks-all"].append((BLOCKER, root + "/robots.txt", "Disallow: /"))
         if "sitemap:" not in body.lower():
             issues["robots-no-sitemap"].append((OBSERVATION, root + "/robots.txt", None))
-        if not blanket:
-            # sitemap-listed-but-robots-blocked = contradictory signals per URL
-            rp = urllib.robotparser.RobotFileParser()
-            rp.parse(body.splitlines())
-            for u in sitemap_urls:
-                for agent in ("Googlebot", "performify-seo-audit"):
-                    if not rp.can_fetch(agent, u):
-                        issues["robots-blocked-sitemap-url"].append(
-                            (BLOCKER, u, f"blocked for {agent}"))
-                        break
+        # what matters for indexation is what GOOGLEBOT may fetch — judged by the
+        # real parser, per group, never by grepping for Disallow lines
+        rp = urllib.robotparser.RobotFileParser()
+        rp.parse(body.splitlines())
+        g_blocked = [u for u in sitemap_urls if not rp.can_fetch("Googlebot", u)]
+        home_blocked = not rp.can_fetch("Googlebot", root + "/")
+        if home_blocked and sitemap_urls and len(g_blocked) >= 0.95 * len(sitemap_urls):
+            issues["robots-blocks-all"].append(
+                (BLOCKER, root + "/robots.txt",
+                 f"Googlebot blocked from the homepage and "
+                 f"{len(g_blocked)}/{len(sitemap_urls)} sitemap URLs"))
+        else:
+            for u in g_blocked:
+                issues["robots-blocked-sitemap-url"].append((BLOCKER, u, "blocked for Googlebot"))
+        # the audit UA being blocked is a coverage caveat, never an SEO finding
+        audit_only = [u for u in sitemap_urls
+                      if not rp.can_fetch("performify-seo-audit", u)]
+        audit_only = [u for u in audit_only if u not in set(g_blocked)]
+        if audit_only:
+            issues["robots-blocks-audit-ua"].append(
+                (OBSERVATION, root + "/robots.txt",
+                 f"{len(audit_only)} sitemap URLs blocked for the audit UA but not for "
+                 f"Googlebot — audit coverage may be limited"))
 
     if parsed.scheme == "https":
         h = fetch(f"http://{parsed.netloc}/", follow=False)
@@ -876,9 +1022,22 @@ def site_checks(base_url, pages, sitemap_urls, log):
             issues["no-https-redirect"].append((CLASS_OF["no-https-redirect"], f"http://{parsed.netloc}/",
                                                 f"HTTP {h['status']} (expected 301)"))
 
+    # duplicates only across indexable, non-redirected, self-canonical pages —
+    # a redirected sitemap URL parses its destination's metadata, and pages
+    # deliberately canonicalising to one destination are consolidation, not
+    # duplication
+    def dup_eligible(pg):
+        if not pg.get("html") or pg.get("redirected") or pg.get("noindex"):
+            return False
+        canon = pg.get("canonical_abs")
+        if canon and norm_url(canon) != norm_url(pg.get("final_url") or pg["url"]):
+            return False
+        return True
+
+    eligible = [pg for pg in pages if dup_eligible(pg)]
     for field, code in (("title", "duplicate-title"), ("description", "duplicate-description")):
         groups = defaultdict(list)
-        for pg in pages:
+        for pg in eligible:
             if pg.get(field):
                 groups[pg[field]].append(pg["url"])
         for val, urls in groups.items():
@@ -913,9 +1072,11 @@ def coverage_stats(model):
         if r["status"] >= 400:
             stats["broken"] += 1
             continue
+        # categories are exclusive: a redirected sitemap URL is "redirected",
+        # not also an indexable sitemap entry — the sitemap listed the wrong URL
         if r["chain"]:
             stats["redirected"] += 1
-        if data.get("noindex"):
+        elif data.get("noindex"):
             stats["noindexed"] += 1
         elif data.get("html"):
             stats["indexable_html"] += 1
@@ -926,7 +1087,7 @@ def coverage_stats(model):
     return stats
 
 
-def build_report(model, tty=False, md=False):
+def build_report(model, tty=False, md=False, explain=False):
     cls_colour = {BLOCKER: "31;1", MATERIAL: "33", OPPORTUNITY: "36", OBSERVATION: "2"}
     grouped, ranked, cov = model["grouped"], model["ranked"], model["coverage"]
     crawled_urls = [r["url"] for r, _ in model["results"]]
@@ -936,8 +1097,13 @@ def build_report(model, tty=False, md=False):
     h = (lambda s: f"## {s}") if md else (lambda s: c("1", s.upper(), tty))
     bullet = "- " if md else "  "
 
-    def code_label(code, cls):
-        return f"`{code}`" if md else c(cls_colour[cls], f"[{code}]", tty)
+    def head(e):
+        text = label(e["code"])
+        return f"**{text}**" if md else c(cls_colour[e["class"]], text, tty)
+
+    def maths(e):
+        return (f" (score {e['score']} = impact {e['impact']} x confidence {e['confidence']} "
+                f"x {e['affected']}/{cov['crawled']} affected) [{e['code']}]") if explain else ""
 
     def clusters_for(code, max_lines=2):
         urls = list(dict.fromkeys(u for _, u, _ in grouped[code]))
@@ -973,16 +1139,18 @@ def build_report(model, tty=False, md=False):
         w(f"{bullet}{ttfb_note}fetch time median {cov['fetch_median']:.2f}s, p90 {cov['fetch_p90']:.2f}s.")
     w("")
 
-    # PRIORITY ACTIONS — top 3 blocker/material by score, inputs visible
+    # PRIORITY ACTIONS — top 3 blocker/material by score (see --explain-scores)
     priority = [e for e in ranked if e["class"] in (BLOCKER, MATERIAL)]
     w(h("Priority actions"))
     if not priority:
         w(f"{bullet}None — no indexation blockers or material issues found.")
     for i, e in enumerate(priority[:3], 1):
         code = e["code"]
-        scoring = (f"score {e['score']} = impact {e['impact']} x confidence {e['confidence']} "
-                   f"x {e['n']}/{cov['crawled']} affected")
-        w(f"{i}. {code_label(code, e['class'])} {e['n']} URL{'s' if e['n'] != 1 else ''} — {scoring}")
+        scope = (f"affects {e['affected']} of {cov['crawled']} crawled pages"
+                 if e["affected"] != e["n"] or e["n"] > 1
+                 else f"{e['n']} URL")
+        w(f"{i}. {head(e)} — {level_word(e['impact'])} impact, "
+          f"{level_word(e['confidence'])} confidence — {scope}{maths(e)}")
         for line, examples in clusters_for(code):
             if line:
                 w(f"{bullet}   {line}")
@@ -990,7 +1158,7 @@ def build_report(model, tty=False, md=False):
                 w(f"{bullet}     {u}")
         w(f"{bullet}   Fix: {FIX_HINTS.get(code, code)}")
     if len(priority) > 3:
-        rest = " · ".join(f"{e['code']} ×{e['n']} (score {e['score']})" for e in priority[3:])
+        rest = " · ".join(f"{label(e['code'])} ×{e['n']}{maths(e)}" for e in priority[3:])
         w(f"{bullet}Also: {rest}")
     w("")
 
@@ -1000,7 +1168,7 @@ def build_report(model, tty=False, md=False):
         w(h("Secondary opportunities"))
         for e in opps:
             code = e["code"]
-            w(f"{bullet}{code_label(code, OPPORTUNITY)} ×{e['n']} — {FIX_HINTS.get(code, code)}")
+            w(f"{bullet}{head(e)} ×{e['n']}{maths(e)} — {FIX_HINTS.get(code, code)}")
             for line, examples in clusters_for(code, max_lines=1):
                 if line:
                     w(f"{bullet}    {line} — e.g. {examples[0]}")
@@ -1013,7 +1181,7 @@ def build_report(model, tty=False, md=False):
     if obs:
         w(h("Observations"))
         for e in obs:
-            w(f"{bullet}{code_label(e['code'], OBSERVATION)} ×{e['n']} — {FIX_HINTS.get(e['code'], e['code'])}")
+            w(f"{bullet}{head(e)} ×{e['n']} — {FIX_HINTS.get(e['code'], e['code'])}")
         w("")
 
     if not ranked:
@@ -1090,7 +1258,8 @@ def stratified_sample(page_urls, source_of, max_pages):
 
 
 # ---------------------------------------------------------------- pipeline
-def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lambda *a: None):
+def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
+              check_links=False, log=lambda *a: None):
     """Full pipeline: discover -> sample -> crawl -> check. Returns a model dict.
 
     Returns None if no sitemap URLs could be discovered.
@@ -1152,14 +1321,32 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lamb
     for cls, url, detail in timing_checks(results):
         grouped["slow-fetch-outlier"].append((cls, url, detail))
 
-    # internal-link graph, orphans, canonical targets
+    # internal-link graph, orphans, canonical targets — sources_by_code feeds
+    # the ranking with the real scope (linking pages, not issue-target URLs)
+    scope_sources = defaultdict(set)
     base_netloc = urllib.parse.urlparse(base).netloc
-    graph_index, inlinks = build_link_graph(results, base_netloc)
-    for checks in (link_checks(graph_index, inlinks),
-                   orphan_checks(page_urls, results, inlinks),
-                   canonical_target_checks(results, graph_index, base_netloc, log)):
-        for code, items in checks.items():
+    graph_index, inlink_sources = build_link_graph(results, base_netloc)
+    link_issues, link_scope = link_checks(graph_index, inlink_sources)
+    canon_issues, canon_scope = canonical_target_checks(
+        results, graph_index, base_netloc, log, deadline=deadline)
+    checks = [link_issues, orphan_checks(page_urls, results, inlink_sources), canon_issues]
+    scopes = [link_scope, canon_scope]
+    if check_links:
+        off_issues, off_scope = offsite_link_checks(inlink_sources, graph_index, log,
+                                                    deadline=deadline)
+        checks.append(off_issues)
+        scopes.append(off_scope)
+    for ch in checks:
+        for code, items in ch.items():
             grouped[code].extend(items)
+    for sc in scopes:
+        for code, srcs in sc.items():
+            scope_sources[code].update(srcs)
+
+    affected_pages = {code: len(srcs) for code, srcs in scope_sources.items()}
+    for code in SITE_WIDE:
+        if code in grouped:
+            affected_pages[code] = len(results)
 
     model = {
         "base": base, "sitemaps": sitemaps, "page_urls": page_urls,
@@ -1167,7 +1354,7 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lamb
         "results": results, "pagedata": pagedata, "grouped": grouped,
         "skipped": skipped, "elapsed": time.monotonic() - start,
     }
-    model["ranked"] = rank_issues(grouped, len(results))
+    model["ranked"] = rank_issues(grouped, len(results), affected_pages)
     model["coverage"] = coverage_stats(model)
     model["verdict"] = build_verdict(grouped, model["ranked"], len(results),
                                      [r["url"] for r, _ in results], source_of)
@@ -1188,6 +1375,11 @@ def main():
     ap.add_argument("--delay", type=float, default=0.0, help="Per-worker delay between fetches (s)")
     ap.add_argument("--time-budget", type=float, default=0, metavar="SECONDS",
                     help="Stop starting new fetches after this many seconds (0 = no limit)")
+    ap.add_argument("--check-links", action="store_true",
+                    help="Also verify internal link targets that are not in the sitemap "
+                         "(capped at 50 extra fetches, most-linked first)")
+    ap.add_argument("--explain-scores", action="store_true",
+                    help="Show the score arithmetic and issue codes in the report")
     ap.add_argument("--markdown", metavar="FILE", help="Also write the report as markdown")
     ap.add_argument("--json", metavar="FILE", help="Also dump raw results as JSON")
     ap.add_argument("--quiet", action="store_true", help="Suppress progress output")
@@ -1198,7 +1390,8 @@ def main():
 
     base = args.url if args.url.startswith("http") else "https://" + args.url
     model = run_audit(base, max_pages=args.max_pages, workers=args.workers,
-                      delay=args.delay, time_budget=args.time_budget, log=log)
+                      delay=args.delay, time_budget=args.time_budget,
+                      check_links=args.check_links, log=log)
     if not model["page_urls"]:
         print(f"error: no sitemap URLs found for {base}", file=sys.stderr)
         for u, result in model["sitemaps"].items():
@@ -1206,11 +1399,11 @@ def main():
         sys.exit(1)
 
     grouped = model["grouped"]
-    print(build_report(model, tty=tty))
+    print(build_report(model, tty=tty, explain=args.explain_scores))
 
     if args.markdown:
         with open(args.markdown, "w") as f:
-            f.write(build_report(model, md=True) + "\n")
+            f.write(build_report(model, md=True, explain=args.explain_scores) + "\n")
         log(f"markdown report -> {args.markdown}")
     if args.json:
         pages_out = [{k: v for k, v in pg.items() if k != "links"} for pg in model["pagedata"]]
