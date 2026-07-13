@@ -1002,6 +1002,71 @@ def build_report(model, tty=False, md=False):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- sampling
+def _evenly_spaced(items, k):
+    if k >= len(items):
+        return list(items)
+    step = len(items) / k
+    return [items[int(i * step)] for i in range(k)]
+
+
+def stratified_sample(page_urls, source_of, max_pages):
+    """Sample proportionally per child sitemap (minimum 3 per sitemap), always
+    including the homepage and top-level pages, evenly spaced within each
+    stratum — so every site section is represented, weighted by its size."""
+    if max_pages <= 0 or len(page_urls) <= max_pages:
+        return page_urls
+
+    def is_top_level(u):
+        return "/" not in urllib.parse.urlparse(u).path.strip("/")
+
+    must = [u for u in page_urls if is_top_level(u)]
+    if len(must) >= max_pages:
+        return _evenly_spaced(must, max_pages)
+
+    rest = [u for u in page_urls if u not in set(must)]
+    strata = {}
+    for u in rest:
+        strata.setdefault(source_of.get(u, ""), []).append(u)
+    budget = max_pages - len(must)
+
+    quotas = {sm: min(3, len(us)) for sm, us in strata.items()}
+    spent = sum(quotas.values())
+    if spent > budget:
+        # more sitemaps than the budget can give 3 each: round-robin one at a
+        # time, biggest strata first (len(rest) > budget, so this terminates)
+        quotas = {sm: 0 for sm in strata}
+        order = sorted(strata, key=lambda sm: -len(strata[sm]))
+        i = 0
+        while budget > 0:
+            sm = order[i % len(order)]
+            if quotas[sm] < len(strata[sm]):
+                quotas[sm] += 1
+                budget -= 1
+            i += 1
+    else:
+        # spread what's left proportionally to remaining stratum capacity
+        left = budget - spent
+        capacity = {sm: len(us) - quotas[sm] for sm, us in strata.items()}
+        total_cap = sum(capacity.values())
+        if total_cap and left:
+            shares = {sm: left * capacity[sm] / total_cap for sm in strata}
+            for sm in strata:
+                quotas[sm] += int(shares[sm])
+            leftover = left - sum(int(s) for s in shares.values())
+            for sm in sorted(strata, key=lambda s: -(shares[s] - int(shares[s]))):
+                if leftover <= 0:
+                    break
+                if quotas[sm] < len(strata[sm]):
+                    quotas[sm] += 1
+                    leftover -= 1
+
+    sample = list(must)
+    for sm, us in strata.items():
+        sample.extend(_evenly_spaced(us, quotas[sm]))
+    return sample
+
+
 # ---------------------------------------------------------------- pipeline
 def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lambda *a: None):
     """Full pipeline: discover -> sample -> crawl -> check. Returns a model dict.
@@ -1015,10 +1080,7 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lamb
         return {"base": base, "sitemaps": sitemaps, "page_urls": []}
 
     sampled = max_pages > 0 and len(page_urls) > max_pages
-    targets = page_urls
-    if sampled:
-        step = len(page_urls) / max_pages
-        targets = [page_urls[int(i * step)] for i in range(max_pages)]
+    targets = stratified_sample(page_urls, source_of, max_pages)
     log(f"Crawling {len(targets)} of {len(page_urls)} URLs with {workers} workers ...")
 
     results = []

@@ -541,5 +541,68 @@ class TestTimingOutliers(unittest.TestCase):
         self.assertEqual(sa.timing_checks(results), [])
 
 
+# ---------------------------------------------------------------- stratified sampling
+class TestStratifiedSampling(unittest.TestCase):
+    BASE = "https://example.com"
+
+    def _site(self):
+        home = [f"{self.BASE}/", f"{self.BASE}/about", f"{self.BASE}/contact"]
+        products = [f"{self.BASE}/products/p{i}" for i in range(90)]
+        blog = [f"{self.BASE}/blog/post-{i}" for i in range(4)]
+        source_of = {u: f"{self.BASE}/pages.xml" for u in home}
+        source_of.update({u: f"{self.BASE}/products.xml" for u in products})
+        source_of.update({u: f"{self.BASE}/blog.xml" for u in blog})
+        return home + products + blog, source_of
+
+    def test_respects_max_pages(self):
+        urls, source_of = self._site()
+        sample = sa.stratified_sample(urls, source_of, 20)
+        self.assertEqual(len(sample), 20)
+        self.assertEqual(len(set(sample)), 20)
+
+    def test_homepage_and_top_level_always_included(self):
+        urls, source_of = self._site()
+        sample = sa.stratified_sample(urls, source_of, 20)
+        for u in (f"{self.BASE}/", f"{self.BASE}/about", f"{self.BASE}/contact"):
+            self.assertIn(u, sample)
+
+    def test_minimum_three_per_sitemap(self):
+        urls, source_of = self._site()
+        sample = sa.stratified_sample(urls, source_of, 20)
+        blog_sampled = [u for u in sample if "/blog/" in u]
+        self.assertGreaterEqual(len(blog_sampled), 3)
+
+    def test_proportional_to_stratum_size(self):
+        urls, source_of = self._site()
+        sample = sa.stratified_sample(urls, source_of, 20)
+        products_sampled = [u for u in sample if "/products/" in u]
+        blog_sampled = [u for u in sample if "/blog/" in u]
+        self.assertGreater(len(products_sampled), len(blog_sampled))
+
+    def test_zero_means_crawl_all(self):
+        urls, source_of = self._site()
+        self.assertEqual(sa.stratified_sample(urls, source_of, 0), urls)
+
+    def test_small_sitemap_untouched(self):
+        urls, source_of = self._site()
+        self.assertEqual(sa.stratified_sample(urls, source_of, 500), urls)
+
+    def test_more_top_level_than_budget(self):
+        urls = [f"{self.BASE}/page-{i}" for i in range(50)]
+        source_of = {u: f"{self.BASE}/sitemap.xml" for u in urls}
+        sample = sa.stratified_sample(urls, source_of, 10)
+        self.assertEqual(len(sample), 10)
+
+    def test_many_sitemaps_tight_budget(self):
+        urls, source_of = [], {}
+        for s in range(10):
+            for i in range(5):
+                u = f"{self.BASE}/s{s}/p{i}"
+                urls.append(u)
+                source_of[u] = f"{self.BASE}/s{s}.xml"
+        sample = sa.stratified_sample(urls, source_of, 12)
+        self.assertEqual(len(sample), 12)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
