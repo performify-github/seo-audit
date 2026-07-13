@@ -56,7 +56,7 @@ FIX_HINTS = {
     "no-https-redirect": "http:// version doesn't redirect to https — duplicate-protocol indexing risk.",
     "robots-missing": "Add a robots.txt referencing the sitemap.",
     "robots-no-sitemap": "Reference the sitemap in robots.txt (Sitemap: <url>) so all crawlers find it.",
-    "images-missing-alt": "Alt text is an accessibility requirement and an image-search ranking input.",
+    "images-missing-alt": "Images with no alt attribute at all — add alt text, or alt=\"\" if purely decorative.",
     "no-structured-data": "No JSON-LD found — structured data unlocks rich results (org, product, article, FAQ...).",
     "missing-viewport": "No viewport meta = fails mobile-friendly checks; mobile-first indexing applies.",
     "description-length": "Aim for 70-160 chars so the snippet neither truncates nor looks empty.",
@@ -224,8 +224,9 @@ class PageParser(HTMLParser):
             self._buf = []
         elif tag == "img":
             self.img_total += 1
-            alt = a.get("alt")
-            if alt is None or not alt.strip():
+            # alt="" is deliberate (decorative image, screen-reader skip) — only an
+            # absent alt attribute is a defect
+            if a.get("alt") is None:
                 self.img_missing_alt += 1
             src = a.get("src", "")
             if src.startswith("http://"):
