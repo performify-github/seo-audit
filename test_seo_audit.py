@@ -868,6 +868,47 @@ class TestThrottle(unittest.TestCase):
             srv.shutdown()
 
 
+# ---------------------------------------------------------------- platform fingerprint
+class TestPlatformFingerprint(unittest.TestCase):
+    def _routes(self, base):
+        return {
+            "/robots.txt": (200, [("Content-Type", "text/plain"),
+                                  ("Powered-By", "Shopify")],
+                            f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+            "/sitemap.xml": (200, XML, sitemap_xml([f"{base}/"])),
+            "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                       canonical=f"{base}/")),
+        }
+
+    def test_shopify_starts_polite_by_default(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            routes.update(self._routes(base))
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0)
+            pol = model["politeness"]
+            self.assertEqual(pol["platform"], "shopify")
+            self.assertEqual(pol["workers"], 2)
+            self.assertGreaterEqual(pol["floor"], 1.0)
+        finally:
+            srv.shutdown()
+
+    def test_explicit_flags_override_fingerprint(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            routes.update(self._routes(base))
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4, delay=0.1)
+            pol = model["politeness"]
+            self.assertEqual(pol["platform"], "shopify")   # detected, but not applied
+            self.assertEqual(pol["workers"], 4)
+            self.assertEqual(pol["floor"], 0.1)
+        finally:
+            srv.shutdown()
+
+
 # ---------------------------------------------------------------- http probe judgment
 class TestHttpProbeJudgment(unittest.TestCase):
     def _h(self, status, location=None, error=None):

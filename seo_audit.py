@@ -1068,7 +1068,7 @@ def _judge_canonical_target(r, noindex, sources):
 
 
 def canonical_target_checks(results, index, base_netloc, log, max_fetch=20,
-                            workers=4, deadline=None):
+                            workers=4, deadline=None, throttle=None):
     """Validate where canonicals point. Crawled targets are judged from crawl
     data; at most max_fetch deduped out-of-crawl targets get fetched
     concurrently, most-used targets first, honouring any time budget.
@@ -1116,7 +1116,9 @@ def canonical_target_checks(results, index, base_netloc, log, max_fetch=20,
     def verify(t):
         if deadline and time.monotonic() > deadline:
             return t, None, None
-        r = fetch_with_retry(t["url"])
+        if throttle:
+            throttle.wait()
+        r = fetch_with_retry(t["url"], on_status=throttle.record if throttle else None)
         p = PageParser()
         if not r["error"] and r["status"] and r["status"] < 400 \
                 and "html" in r["headers"].get("Content-Type", ""):
@@ -1142,7 +1144,8 @@ def canonical_target_checks(results, index, base_netloc, log, max_fetch=20,
     return issues, sources_by_code
 
 
-def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4, deadline=None):
+def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4,
+                        deadline=None, throttle=None):
     """--check-links: verify internal link targets that are NOT in the crawl
     set (off-sitemap destinations — where broken internal links usually live).
     Capped, concurrent, most-linked first. Returns (issues, sources_by_code)."""
@@ -1153,16 +1156,20 @@ def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4, dea
     if len(unknown) > max_fetch:
         log(f"  link check: verifying {max_fetch} of {len(unknown)} off-sitemap "
             f"targets (most-linked first)")
+    unverified = max(0, len(unknown) - max_fetch)
 
     def verify(item):
         t, srcs = item
         if deadline and time.monotonic() > deadline:
             return t, srcs, None
-        return t, srcs, fetch_with_retry(t)
+        if throttle:
+            throttle.wait()
+        return t, srcs, fetch_with_retry(t, on_status=throttle.record if throttle else None)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for t, srcs, r in ex.map(verify, unknown[:max_fetch]):
             if r is None or r["status"] in RATE_LIMIT_STATUSES:
+                unverified += 1
                 continue  # unverified — never report a throttled target as broken
             n = len(srcs)
             linked = f"linked from {n} crawled page{'s' if n != 1 else ''}, not in sitemap"
@@ -1174,6 +1181,8 @@ def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4, dea
                 issues["internal-link-broken"].append(
                     (CLASS_OF["internal-link-broken"], t, f"{linked} — HTTP {r['status']}"))
                 sources_by_code["internal-link-broken"].update(srcs)
+    if unverified:
+        log(f"  link check: {unverified} target(s) left unverified (cap, rate limit, or time budget)")
     return issues, sources_by_code
 
 
@@ -1496,7 +1505,7 @@ def stratified_sample(page_urls, source_of, max_pages):
 
 
 # ---------------------------------------------------------------- pipeline
-def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
+def run_audit(base, max_pages=100, workers=None, delay=None, time_budget=0,
               check_links=False, log=lambda *a: None):
     """Full pipeline: discover -> sample -> crawl -> check. Returns a model dict.
 
@@ -1513,8 +1522,10 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
 
     # adaptive politeness: robots.txt Crawl-delay is a floor, 429/503 anywhere
     # backs the whole crawl off; slow start applies when --delay wasn't given
-    # and the crawl is big enough for a ramp to mean anything
-    throttle = Throttle(delay=delay, slow_start=(delay == 0 and len(targets) > 20))
+    # and the crawl is big enough for a ramp to mean anything. None = auto.
+    auto_workers, auto_delay = workers is None, delay is None
+    workers, delay = workers or 8, delay or 0.0
+    throttle = Throttle(delay=delay, slow_start=(auto_delay and len(targets) > 20))
     parsed_base = urllib.parse.urlparse(base)
     root = f"{parsed_base.scheme}://{parsed_base.netloc}"
     robots_result = fetch_with_retry(root + "/robots.txt")
@@ -1526,6 +1537,19 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
             throttle.raise_floor(min(float(cd), 10.0))
             log(f"  robots.txt Crawl-delay {cd:g}s honoured"
                 + (" (capped at 10s)" if cd > 10 else ""))
+
+    # platform fingerprint: Shopify's limiter trips on the initial burst faster
+    # than adaptive backoff can react (measured: 8 workers -> 68% of a sample
+    # rate-limited) — start polite there unless flags explicitly say otherwise
+    platform = None
+    if "shopify" in (robots_result["headers"].get("Powered-By") or "").lower():
+        platform = "shopify"
+        if auto_workers:
+            workers = 2
+        if auto_delay:
+            throttle.raise_floor(1.0)
+        log(f"  Shopify origin detected — starting polite "
+            f"({workers} workers, {throttle.floor:g}s delay floor)")
 
     log(f"Crawling {len(targets)} of {len(page_urls)} URLs with {workers} workers ...")
     results = []
@@ -1582,12 +1606,12 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
     graph_index, inlink_sources = build_link_graph(results, base_netloc)
     link_issues, link_scope = link_checks(graph_index, inlink_sources)
     canon_issues, canon_scope = canonical_target_checks(
-        results, graph_index, base_netloc, log, deadline=deadline)
+        results, graph_index, base_netloc, log, deadline=deadline, throttle=throttle)
     checks = [link_issues, orphan_checks(page_urls, results, inlink_sources), canon_issues]
     scopes = [link_scope, canon_scope]
     if check_links:
         off_issues, off_scope = offsite_link_checks(inlink_sources, graph_index, log,
-                                                    deadline=deadline)
+                                                    deadline=deadline, throttle=throttle)
         checks.append(off_issues)
         scopes.append(off_scope)
     for ch in checks:
@@ -1609,7 +1633,8 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
         "skipped": skipped, "elapsed": time.monotonic() - start,
         "sitemap_truncated": sitemap_truncated,
         "politeness": {
-            "robots_crawl_delay": robots_crawl_delay,
+            "robots_crawl_delay": robots_crawl_delay, "platform": platform,
+            "workers": workers,
             "floor": throttle.floor, "final_delay": round(throttle.delay, 2),
             "peak_delay": round(throttle.peak, 2), "throttled": throttle.throttled,
         },
@@ -1638,8 +1663,11 @@ def main():
     ap.add_argument("url", help="Sitemap URL or site root (https://example.com)")
     ap.add_argument("--max-pages", type=int, default=100,
                     help="Max pages to crawl (default 100; 0 = crawl the whole sitemap)")
-    ap.add_argument("--workers", type=int, default=8, help="Concurrent fetches (default 8)")
-    ap.add_argument("--delay", type=float, default=0.0, help="Per-worker delay between fetches (s)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="Concurrent fetches (default 8; auto-drops to 2 on Shopify unless set)")
+    ap.add_argument("--delay", type=float, default=None,
+                    help="Politeness floor (s) per fetch (default 0; robots Crawl-delay, "
+                         "platform detection and adaptive backoff can raise it, never lower)")
     ap.add_argument("--time-budget", type=float, default=0, metavar="SECONDS",
                     help="Stop starting new fetches after this many seconds (0 = no limit)")
     ap.add_argument("--check-links", action="store_true",

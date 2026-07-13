@@ -34,15 +34,21 @@ The crawl detects how polite to be, so `--workers 2 --delay 1` is rarely needed:
 
 - **robots.txt `Crawl-delay`** for the audit UA is honoured as a delay floor (capped
   at 10s), noted in the report.
+- **Platform fingerprint**: a `Powered-By: Shopify` header at discovery starts the
+  crawl at 2 workers with a 1s floor — Shopify's limiter trips on the initial burst
+  faster than reactive backoff can respond (measured: 8 workers cost 68% of a sample
+  to rate-limiting, and the block outlives the crawl).
 - **Any 429/503 anywhere doubles a shared delay** for every worker (capped 15s) — one
   throttle signal slows the whole crawl, not just the URL that saw it. Twenty
-  consecutive clean responses halve it back toward the floor.
+  consecutive clean responses halve it back toward the floor. Canonical-target and
+  `--check-links` fetches obey the same throttle.
 - **Slow start**: with no explicit `--delay` on crawls >20 pages, the first 10 fetches
   run at 0.5s until the origin proves fast.
 
-`--delay` pins the floor exactly — adaptive behaviour only ever makes the crawl
-*more* polite, never faster than your flags. The coverage block states what happened
-("backed off to 4s/fetch after 3 throttle responses") so a rerun is explainable.
+Explicit `--workers`/`--delay` pin behaviour exactly — adaptive behaviour only ever
+makes the crawl *more* polite, never faster than your flags. The coverage block states
+what happened ("backed off to 4s/fetch after 3 throttle responses") so a rerun is
+explainable.
 
 Individual 429/503 responses are also retried with backoff (honouring `Retry-After`).
 Pages still throttled after retries are reported as **rate-limited (NOT audited)** — a
