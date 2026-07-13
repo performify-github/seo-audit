@@ -1366,6 +1366,12 @@ def has_blockers(grouped):
 
 
 # ---------------------------------------------------------------- main
+def auto_report_name(base, ext):
+    """Unique default report filename: seo-audit-<host>-<timestamp>.<ext>."""
+    host = re.sub(r"[^a-z0-9]+", "-", urllib.parse.urlparse(base).netloc.lower()).strip("-")
+    return f"seo-audit-{host}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Streamlined technical SEO audit from a sitemap.")
     ap.add_argument("url", help="Sitemap URL or site root (https://example.com)")
@@ -1380,8 +1386,12 @@ def main():
                          "(capped at 50 extra fetches, most-linked first)")
     ap.add_argument("--explain-scores", action="store_true",
                     help="Show the score arithmetic and issue codes in the report")
-    ap.add_argument("--markdown", metavar="FILE", help="Also write the report as markdown")
-    ap.add_argument("--json", metavar="FILE", help="Also dump raw results as JSON")
+    ap.add_argument("--markdown", metavar="FILE", nargs="?", const="auto",
+                    help="Also write the report as markdown. Without FILE, auto-names "
+                         "seo-audit-<host>-<timestamp>.md (put the flag AFTER the url)")
+    ap.add_argument("--json", metavar="FILE", nargs="?", const="auto",
+                    help="Also dump raw results as JSON. Without FILE, auto-names "
+                         "seo-audit-<host>-<timestamp>.json")
     ap.add_argument("--quiet", action="store_true", help="Suppress progress output")
     args = ap.parse_args()
 
@@ -1402,12 +1412,14 @@ def main():
     print(build_report(model, tty=tty, explain=args.explain_scores))
 
     if args.markdown:
-        with open(args.markdown, "w") as f:
+        md_path = auto_report_name(base, "md") if args.markdown == "auto" else args.markdown
+        with open(md_path, "w") as f:
             f.write(build_report(model, md=True, explain=args.explain_scores) + "\n")
-        log(f"markdown report -> {args.markdown}")
+        log(f"markdown report -> {md_path}")
     if args.json:
+        json_path = auto_report_name(base, "json") if args.json == "auto" else args.json
         pages_out = [{k: v for k, v in pg.items() if k != "links"} for pg in model["pagedata"]]
-        with open(args.json, "w") as f:
+        with open(json_path, "w") as f:
             json.dump({"base": base, "sitemaps": model["sitemaps"],
                        "verdict": model["verdict"], "coverage": model["coverage"],
                        "ranking": model["ranked"],
@@ -1416,7 +1428,7 @@ def main():
                        "pages": pages_out,
                        "issues": {k: [{"class": s, "url": u, "detail": d} for s, u, d in v]
                                   for k, v in grouped.items()}}, f, indent=2, default=str)
-        log(f"json dump -> {args.json}")
+        log(f"json dump -> {json_path}")
 
     # exit 2 only when indexation blockers exist
     sys.exit(2 if has_blockers(grouped) else 0)

@@ -668,6 +668,19 @@ class TestTimingOutliers(unittest.TestCase):
         self.assertEqual(sa.timing_checks(results), [])
 
 
+# ---------------------------------------------------------------- report naming
+class TestAutoReportName(unittest.TestCase):
+    def test_host_and_timestamp(self):
+        import re as _re
+        name = sa.auto_report_name("https://uk.stance.com/sitemap.xml", "md")
+        self.assertRegex(name, r"^seo-audit-uk-stance-com-\d{8}-\d{6}\.md$")
+
+    def test_port_is_sanitised(self):
+        name = sa.auto_report_name("http://127.0.0.1:8080/", "json")
+        self.assertTrue(name.startswith("seo-audit-127-0-0-1-8080-"))
+        self.assertTrue(name.endswith(".json"))
+
+
 # ---------------------------------------------------------------- stratified sampling
 class TestStratifiedSampling(unittest.TestCase):
     BASE = "https://example.com"

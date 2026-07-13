@@ -24,8 +24,8 @@ python3 seo_audit.py https://example.com --markdown report.md --json raw.json
 | `--time-budget SECONDS` | 0 (off) | Stop starting new fetches after this long; the report states how many URLs were skipped |
 | `--check-links` | off | Also verify internal link targets that are **not** in the sitemap (capped at 50 extra fetches, most-linked first) |
 | `--explain-scores` | off | Show the score arithmetic and internal issue codes in the report |
-| `--markdown FILE` | — | Also write the report as markdown |
-| `--json FILE` | — | Dump verdict, coverage, ranking, page data + issues as JSON |
+| `--markdown [FILE]` | — | Also write the report as markdown; without FILE, auto-names `seo-audit-<host>-<timestamp>.md` (put the flag after the url) |
+| `--json [FILE]` | — | Dump verdict, coverage, ranking, page data + issues as JSON; auto-names like `--markdown` when FILE is omitted |
 | `--quiet` | — | Suppress progress output |
 
 Rate limiting: 429/503 responses are retried with backoff (honouring `Retry-After`).
