@@ -164,15 +164,27 @@ def discover_and_load_sitemaps(start_url, log):
     parsed = urllib.parse.urlparse(start_url)
     candidates, fallbacks = [], []
     looks_like_sitemap = parsed.path.rstrip("/").endswith((".xml", ".xml.gz")) or "sitemap" in parsed.path.lower()
+    attempts = {}  # url -> outcome, for diagnosable discovery failures
+
+    def outcome(r):
+        if r["error"]:
+            return r["error"]
+        s = f"HTTP {r['status']}"
+        if r["status"] in RATE_LIMIT_STATUSES:
+            s += " — origin is throttling/blocking this client; wait a few minutes, then retry with --workers 2 --delay 1"
+        return s
+
     if looks_like_sitemap:
         candidates.append(start_url)
     else:
         root = f"{parsed.scheme}://{parsed.netloc}"
-        robots = fetch(root + "/robots.txt")
+        robots = fetch_with_retry(root + "/robots.txt")
         if robots["status"] == 200:
             for line in decode_body(robots).splitlines():
                 if line.lower().startswith("sitemap:"):
                     candidates.append(line.split(":", 1)[1].strip())
+        else:
+            attempts[root + "/robots.txt"] = outcome(robots)
         fallbacks = [root + "/sitemap.xml", root + "/sitemap_index.xml"]
 
     seen, pages = set(), []
@@ -184,16 +196,20 @@ def discover_and_load_sitemaps(start_url, log):
         seen.add(sm)
         r = fetch_with_retry(sm)
         if r["status"] != 200 or not r["body"]:
+            attempts[sm] = outcome(r)
             continue
         p, children = parse_sitemap_xml(decode_body(r))
         if p or children:
             log(f"  sitemap: {sm} — {len(p)} pages, {len(children)} child sitemaps")
+            attempts[sm] = f"ok — {len(p)} pages, {len(children)} child sitemaps"
+        else:
+            attempts[sm] = "HTTP 200 but no <loc> entries"
         pages += p
         queue += children
         if pages:
             # a working sitemap was found — no need to probe the guessed fallbacks
             queue = [q for q in queue if q not in fallbacks]
-    return list(dict.fromkeys(pages)), sorted(seen)
+    return list(dict.fromkeys(pages)), attempts
 
 
 # ---------------------------------------------------------------- HTML parsing
@@ -284,10 +300,13 @@ class PageParser(HTMLParser):
 
 
 def norm_url(u):
-    """Normalise for canonical comparison: scheme+host lowered, no fragment, no trailing slash."""
+    """Normalise for canonical comparison: scheme+host lowered, no fragment, no trailing
+    slash, percent-escapes upper-cased (RFC 3986: %e2 == %E2)."""
     p = urllib.parse.urlsplit(u.strip())
     path = p.path.rstrip("/") or "/"
-    return urllib.parse.urlunsplit((p.scheme.lower(), p.netloc.lower(), path, p.query, ""))
+    upper_esc = lambda s: re.sub(r"%[0-9a-fA-F]{2}", lambda m: m.group(0).upper(), s)
+    return urllib.parse.urlunsplit(
+        (p.scheme.lower(), p.netloc.lower(), upper_esc(path), upper_esc(p.query), ""))
 
 
 # ---------------------------------------------------------------- audit
@@ -529,7 +548,9 @@ def main():
     log(f"Discovering sitemap(s) for {base} ...")
     page_urls, sitemaps = discover_and_load_sitemaps(base, log)
     if not page_urls:
-        print(f"error: no sitemap URLs found for {base} (tried: {', '.join(sitemaps)})", file=sys.stderr)
+        print(f"error: no sitemap URLs found for {base}", file=sys.stderr)
+        for u, result in sitemaps.items():
+            print(f"  {u} -> {result}", file=sys.stderr)
         sys.exit(1)
 
     sampled = args.max_pages > 0 and len(page_urls) > args.max_pages
