@@ -871,9 +871,11 @@ class TestThrottle(unittest.TestCase):
 # ---------------------------------------------------------------- platform fingerprint
 class TestPlatformFingerprint(unittest.TestCase):
     def _routes(self, base):
+        # lowercase header name deliberately: Shopify's edge sends
+        # "powered-by", and the lookup must be case-insensitive (live bug)
         return {
             "/robots.txt": (200, [("Content-Type", "text/plain"),
-                                  ("Powered-By", "Shopify")],
+                                  ("powered-by", "Shopify")],
                             f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
             "/sitemap.xml": (200, XML, sitemap_xml([f"{base}/"])),
             "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",

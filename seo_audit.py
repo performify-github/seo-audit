@@ -461,7 +461,7 @@ def fetch_with_retry(url, timeout=TIMEOUT, retries=2, on_status=None):
     for attempt in range(retries):
         if r["status"] not in RATE_LIMIT_STATUSES:
             break
-        ra = r["headers"].get("Retry-After")
+        ra = hget(r["headers"], "Retry-After")
         try:
             wait = min(float(ra), 15.0) if ra else 2.0 * (attempt + 1)
         except ValueError:
@@ -473,8 +473,19 @@ def fetch_with_retry(url, timeout=TIMEOUT, retries=2, on_status=None):
     return r
 
 
+def hget(headers, name, default=None):
+    """Case-insensitive lookup in a plain headers dict — HTTP/2 edges and some
+    origins (Shopify) send lowercase header names, and dict.get() is not
+    forgiving. fetch() stores headers as received."""
+    lname = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lname:
+            return v
+    return default
+
+
 def decode_body(result):
-    ctype = result["headers"].get("Content-Type", "")
+    ctype = hget(result["headers"], "Content-Type", "")
     m = re.search(r"charset=([\w-]+)", ctype)
     enc = m.group(1) if m else "utf-8"
     try:
@@ -852,7 +863,7 @@ def audit_page(result):
         issues.append(issue("redirected-sitemap-url",
                             f"{len(result['chain'])} hop(s) -> {result['final_url']}"))
 
-    ctype = result["headers"].get("Content-Type", "")
+    ctype = hget(result["headers"], "Content-Type", "")
     if "html" not in ctype:
         issues.append(issue("non-html", ctype.split(";")[0] or "no content-type"))
         return issues, data
@@ -867,8 +878,8 @@ def audit_page(result):
 
     # indexability — all robots/googlebot metas plus every X-Robots-Tag header
     xrobots = result.get("xrobots") or []
-    if not xrobots and result["headers"].get("X-Robots-Tag"):
-        xrobots = [result["headers"]["X-Robots-Tag"]]
+    if not xrobots and hget(result["headers"], "X-Robots-Tag"):
+        xrobots = [hget(result["headers"], "X-Robots-Tag")]
     noindex = is_noindexed(p.robots_meta, p.googlebot_meta, xrobots)
     if noindex:
         issues.append(issue("noindex-in-sitemap", None))
@@ -1121,7 +1132,7 @@ def canonical_target_checks(results, index, base_netloc, log, max_fetch=20,
         r = fetch_with_retry(t["url"], on_status=throttle.record if throttle else None)
         p = PageParser()
         if not r["error"] and r["status"] and r["status"] < 400 \
-                and "html" in r["headers"].get("Content-Type", ""):
+                and "html" in hget(r["headers"], "Content-Type", ""):
             try:
                 p.feed(decode_body(r))
                 p.close()
@@ -1195,7 +1206,7 @@ def judge_http_probe(h):
         return None  # http not answering at all is fine — nothing to consolidate
     if h["status"] in (301, 308):
         return None
-    loc = h["headers"].get("Location", "")
+    loc = hget(h["headers"], "Location", "")
     if h["status"] in (302, 303, 307):
         if loc.startswith("https://"):
             return ("temporary-https-redirect", f"HTTP {h['status']} -> {loc}")
@@ -1542,7 +1553,7 @@ def run_audit(base, max_pages=100, workers=None, delay=None, time_budget=0,
     # than adaptive backoff can react (measured: 8 workers -> 68% of a sample
     # rate-limited) — start polite there unless flags explicitly say otherwise
     platform = None
-    if "shopify" in (robots_result["headers"].get("Powered-By") or "").lower():
+    if "shopify" in (hget(robots_result["headers"], "Powered-By") or "").lower():
         platform = "shopify"
         if auto_workers:
             workers = 2
