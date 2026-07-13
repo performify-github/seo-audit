@@ -20,11 +20,11 @@ import json
 import re
 import statistics
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.robotparser
 from collections import Counter, defaultdict
 from html.parser import HTMLParser
 
@@ -342,11 +342,21 @@ def cluster_line(cl):
     return f"{cl['n']}/{cl['of']} crawled pages {where}{sm}{template}"
 
 
-def build_verdict(grouped, ranked, n_crawled, crawled_urls, source_of):
-    """1-2 sentences: indexation health first, then the highest-scored issue."""
+def build_verdict(grouped, ranked, n_crawled, crawled_urls, source_of, scope_sources=None):
+    """1-2 sentences: indexation health first, then the highest-scored issue.
+
+    Blocker scope = affected pages, not issue-object count: a site-wide
+    blocker means every crawled page; scoped issues use their source sets."""
     blockers = [e for e in ranked if e["class"] == BLOCKER]
     if blockers:
-        n_urls = len({u for e in blockers for _, u, _ in grouped[e["code"]]})
+        if any(e["code"] in SITE_WIDE for e in blockers):
+            n_urls = n_crawled
+        else:
+            affected = set()
+            for e in blockers:
+                srcs = (scope_sources or {}).get(e["code"])
+                affected |= set(srcs) if srcs else {u for _, u, _ in grouped[e["code"]]}
+            n_urls = min(n_crawled, len(affected))
         s1 = f"Indexation problems affect {n_urls} of {n_crawled} crawled URLs."
     else:
         s1 = "Indexation is broadly healthy."
@@ -404,7 +414,10 @@ def fetch(url, timeout=TIMEOUT, follow=True):
         except Exception as e:
             return {"url": url, "final_url": current, "status": None, "chain": chain,
                     "error": f"{type(e).__name__}: {e}", "elapsed": time.monotonic() - start,
-                    "ttfb": None, "headers": {}, "body": b""}
+                    "ttfb": None, "headers": {}, "xrobots": [], "body": b""}
+        # repeated X-Robots-Tag headers matter for indexability — dict() keeps
+        # only the last one, so collect them all
+        xrobots = headers.get_all("X-Robots-Tag") if hasattr(headers, "get_all") else None
         if status in (301, 302, 303, 307, 308) and follow:
             loc = headers.get("Location")
             if not loc:
@@ -414,7 +427,8 @@ def fetch(url, timeout=TIMEOUT, follow=True):
             if any(nxt == c[1] for c in chain) or nxt == current:
                 return {"url": url, "final_url": nxt, "status": status, "chain": chain,
                         "error": "redirect loop", "elapsed": time.monotonic() - start,
-                        "ttfb": ttfb, "headers": dict(headers), "body": b""}
+                        "ttfb": ttfb, "headers": dict(headers), "xrobots": xrobots or [],
+                        "body": b""}
             current = nxt
             continue
         if (headers.get("Content-Encoding") == "gzip" or body[:2] == b"\x1f\x8b") and body:
@@ -424,15 +438,21 @@ def fetch(url, timeout=TIMEOUT, follow=True):
                 pass
         return {"url": url, "final_url": current, "status": status, "chain": chain,
                 "error": None, "elapsed": time.monotonic() - start,
-                "ttfb": ttfb, "headers": dict(headers), "body": body}
+                "ttfb": ttfb, "headers": dict(headers), "xrobots": xrobots or [],
+                "body": body}
     return {"url": url, "final_url": current, "status": None, "chain": chain,
             "error": "too many redirects", "elapsed": time.monotonic() - start,
-            "ttfb": ttfb, "headers": {}, "body": b""}
+            "ttfb": ttfb, "headers": {}, "xrobots": [], "body": b""}
 
 
-def fetch_with_retry(url, timeout=TIMEOUT, retries=2):
-    """fetch(), backing off and retrying on 429/503 (honours Retry-After, capped 15s)."""
+def fetch_with_retry(url, timeout=TIMEOUT, retries=2, on_status=None):
+    """fetch(), backing off and retrying on 429/503 (honours Retry-After, capped 15s).
+
+    on_status sees EVERY attempt's status (including the 429s a retry later
+    recovers from) so a shared Throttle can react to throttling globally."""
     r = fetch(url, timeout)
+    if on_status:
+        on_status(r["status"])
     for attempt in range(retries):
         if r["status"] not in RATE_LIMIT_STATUSES:
             break
@@ -443,6 +463,8 @@ def fetch_with_retry(url, timeout=TIMEOUT, retries=2):
             wait = 2.0 * (attempt + 1)
         time.sleep(wait)
         r = fetch(url, timeout)
+        if on_status:
+            on_status(r["status"])
     return r
 
 
@@ -454,6 +476,173 @@ def decode_body(result):
         return result["body"].decode(enc, errors="replace")
     except LookupError:
         return result["body"].decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------- robots & politeness
+class RobotsRules:
+    """Minimal Google-REP robots.txt parser.
+
+    urllib.robotparser predates the 2022 REP spec on the Pythons this tool
+    promises to run on: no * / $ wildcards, no longest-match precedence, and
+    wrong group selection — an Allow: /public/ under Disallow: / is judged
+    blocked. This implements what Google documents: the most specific
+    matching user-agent group, longest-path-match precedence with * and $,
+    Allow winning ties, plus Crawl-delay per group (not Google REP, but the
+    origin's explicit politeness signal).
+    """
+
+    def __init__(self, text=""):
+        self.groups = []   # (agents, rules [(allow, pattern)], crawl_delay)
+        agents, rules, delay = [], [], None
+        last_was_agent = False
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if ":" not in line:
+                continue
+            field, value = line.split(":", 1)
+            field, value = field.strip().lower(), value.strip()
+            if field == "user-agent":
+                if not last_was_agent and agents:
+                    self.groups.append((agents, rules, delay))
+                    agents, rules, delay = [], [], None
+                agents.append(value.lower())
+                last_was_agent = True
+                continue
+            last_was_agent = False
+            if not agents:
+                continue
+            if field in ("allow", "disallow"):
+                if value:  # an empty Disallow: means "allow everything"
+                    rules.append((field == "allow", value))
+            elif field == "crawl-delay":
+                try:
+                    delay = float(value)
+                except ValueError:
+                    pass
+        if agents:
+            self.groups.append((agents, rules, delay))
+
+    def _group_for(self, agent):
+        agent = agent.lower()
+        best, best_len = None, -1
+        for g in self.groups:
+            for a in g[0]:
+                if a != "*" and agent.startswith(a) and len(a) > best_len:
+                    best, best_len = g, len(a)
+        if best:
+            return best
+        for g in self.groups:
+            if "*" in g[0]:
+                return g
+        return None
+
+    @staticmethod
+    def _matches(pattern, path):
+        anchored = pattern.endswith("$")
+        body = pattern[:-1] if anchored else pattern
+        rx = "".join(".*" if ch == "*" else re.escape(ch) for ch in body)
+        return re.match(rx + ("$" if anchored else ""), path) is not None
+
+    def can_fetch(self, agent, url):
+        g = self._group_for(agent)
+        if g is None:
+            return True
+        sp = urllib.parse.urlsplit(url)
+        path = sp.path or "/"
+        if sp.query:
+            path += "?" + sp.query
+        best_allow, best_len = True, -1
+        for allow, pattern in g[1]:
+            if self._matches(pattern, path):
+                plen = len(pattern)
+                if plen > best_len or (plen == best_len and allow and not best_allow):
+                    best_allow, best_len = allow, plen
+        return best_allow if best_len >= 0 else True
+
+    def crawl_delay(self, agent):
+        g = self._group_for(agent)
+        return g[2] if g else None
+
+
+# indexability directive tokens (used to tell an X-Robots-Tag agent prefix
+# from a directive that legitimately contains a colon, e.g. unavailable_after)
+ROBOTS_DIRECTIVES = {
+    "all", "index", "follow", "noindex", "nofollow", "none", "noarchive",
+    "nosnippet", "notranslate", "noimageindex", "indexifembedded",
+    "unavailable_after", "max-snippet", "max-image-preview", "max-video-preview",
+}
+
+
+def is_noindexed(robots_metas, googlebot_metas, xrobots_values):
+    """Most-restrictive-wins across every directive source that applies to
+    Google: every <meta name=robots>, every <meta name=googlebot>, and each
+    X-Robots-Tag header — honouring agent prefixes (another crawler's noindex
+    does not apply) and treating 'none' as noindex per Google's spec. A later
+    'index' never rescues an earlier 'noindex'."""
+    applicable = [v.lower() for v in list(robots_metas) + list(googlebot_metas)]
+    for v in xrobots_values:
+        v = v.strip().lower()
+        head = v.split(":", 1)[0].strip()
+        if ":" in v and head not in ROBOTS_DIRECTIVES:
+            if head in ("googlebot", "robots", "*"):     # scoped to Google/all
+                applicable.append(v.split(":", 1)[1])
+            continue                                     # some other crawler's rule
+        applicable.append(v)
+    tokens = {t.strip() for v in applicable for t in v.split(",")}
+    return bool(tokens & {"noindex", "none"})
+
+
+class Throttle:
+    """Shared adaptive politeness across all workers.
+
+    The user's --delay (and any robots.txt Crawl-delay) is a hard floor —
+    explicit flags pin behaviour. On top of that: any 429/503 anywhere
+    doubles the shared delay (capped 15s) so one throttle signal slows the
+    whole crawl, not just one URL; 20 consecutive clean responses halve it
+    back toward the floor. With no explicit --delay, the first 10 fetches run
+    at a 0.5s slow-start delay until the origin proves fast.
+    """
+
+    def __init__(self, delay=0.0, slow_start=False):
+        self._lock = threading.Lock()
+        self.floor = delay
+        self.delay = delay
+        self.peak = delay
+        self.throttled = 0
+        self._streak = 0
+        self._warmup = 10 if slow_start else 0
+
+    def raise_floor(self, delay):
+        with self._lock:
+            self.floor = max(self.floor, delay)
+            self.delay = max(self.delay, self.floor)
+            self.peak = max(self.peak, self.delay)
+
+    def _next_delay(self):
+        with self._lock:
+            d = self.delay
+            if self._warmup > 0:
+                self._warmup -= 1
+                d = max(d, 0.5)
+        return d
+
+    def wait(self):
+        d = self._next_delay()
+        if d:
+            time.sleep(d)
+
+    def record(self, status):
+        with self._lock:
+            if status in RATE_LIMIT_STATUSES:
+                self.throttled += 1
+                self._streak = 0
+                self.delay = min(15.0, max(1.0, self.delay * 2))
+                self.peak = max(self.peak, self.delay)
+            else:
+                self._streak += 1
+                if self._streak >= 20 and self.delay > self.floor:
+                    self.delay = max(self.floor, self.delay / 2)
+                    self._streak = 0
 
 
 # ---------------------------------------------------------------- sitemap
@@ -470,9 +659,11 @@ def parse_sitemap_xml(text):
 def discover_and_load_sitemaps(start_url, log):
     """Resolve a sitemap URL or site root into a flat list of page URLs.
 
-    Returns (page_urls, sitemaps_probed, source_of) where source_of maps each
-    page URL to the sitemap it was listed in (first occurrence wins) — kept
-    for stratified sampling and pattern clustering.
+    Returns (page_urls, attempts, source_of, truncated) where source_of maps
+    each page URL to the sitemap it was listed in (first occurrence wins) —
+    kept for stratified sampling and pattern clustering — and truncated is
+    True when the 50-sitemap safety cap stopped discovery before the queue
+    was empty (reported totals are then incomplete).
     """
     parsed = urllib.parse.urlparse(start_url)
     candidates, fallbacks = [], []
@@ -524,7 +715,11 @@ def discover_and_load_sitemaps(start_url, log):
         if pages:
             # a working sitemap was found — no need to probe the guessed fallbacks
             queue = [q for q in queue if q not in fallbacks]
-    return list(dict.fromkeys(pages)), attempts, source_of
+    truncated = bool(queue) and len(seen) >= 50
+    if truncated:
+        log(f"  WARNING: sitemap discovery stopped at the 50-file safety limit — "
+            f"{len(queue)} sitemap(s) never read; totals are incomplete")
+    return list(dict.fromkeys(pages)), attempts, source_of, truncated
 
 
 # ---------------------------------------------------------------- HTML parsing
@@ -533,7 +728,8 @@ class PageParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.title = None
         self.description = None
-        self.robots_meta = None
+        self.robots_meta = []      # every <meta name=robots> — never overwrite
+        self.googlebot_meta = []   # crawler-specific directives count too
         self.viewport = None
         self.canonical = None
         self.h1s = []
@@ -561,7 +757,9 @@ class PageParser(HTMLParser):
             if name == "description" and self.description is None:
                 self.description = content.strip()
             elif name == "robots":
-                self.robots_meta = content.lower()
+                self.robots_meta.append(content.lower())
+            elif name == "googlebot":
+                self.googlebot_meta.append(content.lower())
             elif name == "viewport":
                 self.viewport = content
         elif tag == "link" and (a.get("rel") or "").lower() == "canonical" and self.canonical is None:
@@ -654,7 +852,6 @@ def audit_page(result):
         issues.append(issue("non-html", ctype.split(";")[0] or "no content-type"))
         return issues, data
 
-    xrobots = (result["headers"].get("X-Robots-Tag") or "").lower()
     text = decode_body(result)
     p = PageParser()
     try:
@@ -663,9 +860,11 @@ def audit_page(result):
     except Exception:
         pass
 
-    # indexability
-    robots = f"{p.robots_meta or ''} {xrobots}"
-    noindex = "noindex" in robots
+    # indexability — all robots/googlebot metas plus every X-Robots-Tag header
+    xrobots = result.get("xrobots") or []
+    if not xrobots and result["headers"].get("X-Robots-Tag"):
+        xrobots = [result["headers"]["X-Robots-Tag"]]
+    noindex = is_noindexed(p.robots_meta, p.googlebot_meta, xrobots)
     if noindex:
         issues.append(issue("noindex-in-sitemap", None))
 
@@ -913,16 +1112,15 @@ def canonical_target_checks(results, index, base_netloc, log, max_fetch=20,
         if deadline and time.monotonic() > deadline:
             return t, None, None
         r = fetch_with_retry(t["url"])
-        noindex = "noindex" in (r["headers"].get("X-Robots-Tag") or "").lower()
-        if not noindex and not r["error"] and r["status"] and r["status"] < 400 \
+        p = PageParser()
+        if not r["error"] and r["status"] and r["status"] < 400 \
                 and "html" in r["headers"].get("Content-Type", ""):
-            p = PageParser()
             try:
                 p.feed(decode_body(r))
                 p.close()
             except Exception:
                 pass
-            noindex = "noindex" in (p.robots_meta or "")
+        noindex = is_noindexed(p.robots_meta, p.googlebot_meta, r.get("xrobots") or [])
         return t, r, noindex
 
     if to_fetch:
@@ -974,14 +1172,17 @@ def offsite_link_checks(inlink_sources, index, log, max_fetch=50, workers=4, dea
     return issues, sources_by_code
 
 
-def site_checks(base_url, pages, sitemap_urls, log):
-    """Site-level checks: robots.txt (including per-URL robotparser validation
-    of every sitemap URL), https enforcement, duplicates."""
+def site_checks(base_url, pages, sitemap_urls, log, robots_result=None):
+    """Site-level checks: robots.txt (including per-URL validation of every
+    sitemap URL against Googlebot), https enforcement, duplicates.
+
+    robots_result: the already-fetched /robots.txt response (run_audit fetches
+    it once, pre-crawl, for the politeness signals) — fetched here if absent."""
     issues = defaultdict(list)   # code -> [(class, url, detail)]
     parsed = urllib.parse.urlparse(base_url)
     root = f"{parsed.scheme}://{parsed.netloc}"
 
-    r = fetch_with_retry(root + "/robots.txt")
+    r = robots_result or fetch_with_retry(root + "/robots.txt")
     if r["status"] in RATE_LIMIT_STATUSES:
         issues["rate-limited"].append((CLASS_OF["rate-limited"], root + "/robots.txt",
                                        f"HTTP {r['status']} after retries"))
@@ -992,10 +1193,10 @@ def site_checks(base_url, pages, sitemap_urls, log):
         body = decode_body(r)
         if "sitemap:" not in body.lower():
             issues["robots-no-sitemap"].append((OBSERVATION, root + "/robots.txt", None))
-        # what matters for indexation is what GOOGLEBOT may fetch — judged by the
-        # real parser, per group, never by grepping for Disallow lines
-        rp = urllib.robotparser.RobotFileParser()
-        rp.parse(body.splitlines())
+        # what matters for indexation is what GOOGLEBOT may fetch — judged by
+        # the Google-REP parser (wildcards, longest-match, per-group), never by
+        # grepping for Disallow lines
+        rp = RobotsRules(body)
         g_blocked = [u for u in sitemap_urls if not rp.can_fetch("Googlebot", u)]
         home_blocked = not rp.can_fetch("Googlebot", root + "/")
         if home_blocked and sitemap_urls and len(g_blocked) >= 0.95 * len(sitemap_urls):
@@ -1131,12 +1332,24 @@ def build_report(model, tty=False, md=False, explain=False):
     budget_note = f" — time budget hit, {cov['skipped']} URLs not crawled" if cov["skipped"] else ""
     w(f"{bullet}Crawled {cov['crawled']} of {cov['sitemap_total']} sitemap URLs{sample_note} "
       f"in {model['elapsed']:.0f}s{budget_note}.")
+    if model.get("sitemap_truncated"):
+        w(f"{bullet}WARNING: sitemap discovery stopped at the 50-file safety limit — "
+          f"the sitemap total is incomplete.")
     w(f"{bullet}Indexable HTML {cov['indexable_html']} · redirected {cov['redirected']} · "
       f"broken {cov['broken']} · noindexed {cov['noindexed']} · "
       f"rate-limited {cov['rate_limited']} · unreachable {cov['unreachable']}.")
     if cov["fetch_median"] is not None:
         ttfb_note = f"TTFB median {cov['ttfb_median']:.2f}s · " if cov["ttfb_median"] is not None else ""
         w(f"{bullet}{ttfb_note}fetch time median {cov['fetch_median']:.2f}s, p90 {cov['fetch_p90']:.2f}s.")
+    pol = model.get("politeness") or {}
+    pol_bits = []
+    if pol.get("robots_crawl_delay"):
+        pol_bits.append(f"robots.txt Crawl-delay {pol['robots_crawl_delay']:g}s honoured")
+    if pol.get("throttled"):
+        pol_bits.append(f"backed off to {pol['peak_delay']:g}s/fetch after "
+                        f"{pol['throttled']} throttle response{'s' if pol['throttled'] != 1 else ''}")
+    if pol_bits:
+        w(f"{bullet}Politeness: {' · '.join(pol_bits)}.")
     w("")
 
     # PRIORITY ACTIONS — top 3 blocker/material by score (see --explain-scores)
@@ -1194,6 +1407,8 @@ def build_report(model, tty=False, md=False, explain=False):
 
 # ---------------------------------------------------------------- sampling
 def _evenly_spaced(items, k):
+    if k <= 0:
+        return []
     if k >= len(items):
         return list(items)
     step = len(items) / k
@@ -1266,23 +1481,38 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
     """
     start = time.monotonic()
     log(f"Discovering sitemap(s) for {base} ...")
-    page_urls, sitemaps, source_of = discover_and_load_sitemaps(base, log)
+    page_urls, sitemaps, source_of, sitemap_truncated = discover_and_load_sitemaps(base, log)
     if not page_urls:
         return {"base": base, "sitemaps": sitemaps, "page_urls": []}
 
     sampled = max_pages > 0 and len(page_urls) > max_pages
     targets = stratified_sample(page_urls, source_of, max_pages)
-    log(f"Crawling {len(targets)} of {len(page_urls)} URLs with {workers} workers ...")
 
+    # adaptive politeness: robots.txt Crawl-delay is a floor, 429/503 anywhere
+    # backs the whole crawl off; slow start applies when --delay wasn't given
+    # and the crawl is big enough for a ramp to mean anything
+    throttle = Throttle(delay=delay, slow_start=(delay == 0 and len(targets) > 20))
+    parsed_base = urllib.parse.urlparse(base)
+    root = f"{parsed_base.scheme}://{parsed_base.netloc}"
+    robots_result = fetch_with_retry(root + "/robots.txt")
+    robots_crawl_delay = None
+    if robots_result["status"] == 200:
+        cd = RobotsRules(decode_body(robots_result)).crawl_delay("performify-seo-audit")
+        if cd and cd > 0:
+            robots_crawl_delay = cd
+            throttle.raise_floor(min(float(cd), 10.0))
+            log(f"  robots.txt Crawl-delay {cd:g}s honoured"
+                + (" (capped at 10s)" if cd > 10 else ""))
+
+    log(f"Crawling {len(targets)} of {len(page_urls)} URLs with {workers} workers ...")
     results = []
     deadline = start + time_budget if time_budget else None
 
     def worker(u):
         if deadline and time.monotonic() > deadline:
             return None
-        if delay:
-            time.sleep(delay)
-        r = fetch_with_retry(u)
+        throttle.wait()
+        r = fetch_with_retry(u, on_status=throttle.record)
         return audit_page(r), r
 
     skipped = 0
@@ -1316,7 +1546,8 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
         pagedata.append(data)
         for cls, code, detail in issues_:
             grouped[code].append((cls, raw["url"], detail))
-    for code, items in site_checks(base, pagedata, page_urls, log).items():
+    for code, items in site_checks(base, pagedata, page_urls, log,
+                                   robots_result=robots_result).items():
         grouped[code].extend(items)
     for cls, url, detail in timing_checks(results):
         grouped["slow-fetch-outlier"].append((cls, url, detail))
@@ -1353,11 +1584,18 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0,
         "source_of": source_of, "sampled": sampled, "targets": targets,
         "results": results, "pagedata": pagedata, "grouped": grouped,
         "skipped": skipped, "elapsed": time.monotonic() - start,
+        "sitemap_truncated": sitemap_truncated,
+        "politeness": {
+            "robots_crawl_delay": robots_crawl_delay,
+            "floor": throttle.floor, "final_delay": round(throttle.delay, 2),
+            "peak_delay": round(throttle.peak, 2), "throttled": throttle.throttled,
+        },
     }
     model["ranked"] = rank_issues(grouped, len(results), affected_pages)
     model["coverage"] = coverage_stats(model)
     model["verdict"] = build_verdict(grouped, model["ranked"], len(results),
-                                     [r["url"] for r, _ in results], source_of)
+                                     [r["url"] for r, _ in results], source_of,
+                                     scope_sources)
     return model
 
 
@@ -1422,6 +1660,8 @@ def main():
         with open(json_path, "w") as f:
             json.dump({"base": base, "sitemaps": model["sitemaps"],
                        "verdict": model["verdict"], "coverage": model["coverage"],
+                       "politeness": model["politeness"],
+                       "sitemap_truncated": model["sitemap_truncated"],
                        "ranking": model["ranked"],
                        "impact_table": {k: {"impact": i, "confidence": cf}
                                         for k, (i, cf) in IMPACT.items()},

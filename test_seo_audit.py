@@ -21,17 +21,22 @@ for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy
 
 # ---------------------------------------------------------------- fixtures
 def make_server(routes):
-    """Serve a dict path -> (status, headers, body-bytes-or-callable)."""
+    """Serve a dict path -> (status, headers, body) | callable returning that.
+
+    headers may be a dict or a list of (name, value) tuples (repeated headers)."""
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             entry = routes.get(self.path)
             if entry is None:
                 entry = (404, {"Content-Type": "text/html"}, b"<html><body>gone</body></html>")
+            if callable(entry):
+                entry = entry()
             status, headers, body = entry
             if callable(body):
                 body = body()
             self.send_response(status)
-            for k, v in headers.items():
+            items = headers.items() if isinstance(headers, dict) else headers
+            for k, v in items:
                 self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -47,8 +52,8 @@ def make_server(routes):
 
 def html_page(title="A perfectly reasonable page title here", desc="D" * 100,
               h1s=("Main heading",), canonical=None, words=250, noindex=False,
-              viewport=True, jsonld=True, links=(), body_extra=""):
-    parts = ["<html><head>"]
+              viewport=True, jsonld=True, links=(), body_extra="", head_extra=""):
+    parts = ["<html><head>", head_extra]
     if title is not None:
         parts.append(f"<title>{title}</title>")
     if desc is not None:
@@ -610,6 +615,9 @@ class TestRobotsValidation(unittest.TestCase):
         # one technical URL, but scope = every crawled page
         self.assertEqual(top["affected"], len(model["results"]))
         self.assertEqual(top["score"], 25.0)
+        # the verdict speaks in affected pages too, not issue-object counts
+        n = len(model["results"])
+        self.assertIn(f"Indexation problems affect {n} of {n} crawled URLs", model["verdict"])
 
 
 class TestRankingScope(unittest.TestCase):
@@ -666,6 +674,220 @@ class TestTimingOutliers(unittest.TestCase):
         results.append(_timing_result("err", 9.0, status=None, error="timeout"))
         results.append(_timing_result("gone", 9.0, status=404))
         self.assertEqual(sa.timing_checks(results), [])
+
+
+# ---------------------------------------------------------------- robots REP parser
+class TestRobotsRules(unittest.TestCase):
+    def test_allow_wins_by_longest_match(self):
+        rp = sa.RobotsRules("User-agent: *\nDisallow: /\nAllow: /public/\n")
+        self.assertTrue(rp.can_fetch("Googlebot", "https://x/public/page"))
+        self.assertFalse(rp.can_fetch("Googlebot", "https://x/private"))
+        self.assertFalse(rp.can_fetch("Googlebot", "https://x/"))
+
+    def test_wildcard_patterns(self):
+        rp = sa.RobotsRules("User-agent: *\nDisallow: /*?sort=\n")
+        self.assertFalse(rp.can_fetch("Googlebot", "https://x/products?sort=price"))
+        self.assertTrue(rp.can_fetch("Googlebot", "https://x/products"))
+
+    def test_dollar_anchor(self):
+        rp = sa.RobotsRules("User-agent: *\nDisallow: /*.pdf$\n")
+        self.assertFalse(rp.can_fetch("Googlebot", "https://x/doc.pdf"))
+        self.assertTrue(rp.can_fetch("Googlebot", "https://x/doc.pdf?page=2"))
+        self.assertTrue(rp.can_fetch("Googlebot", "https://x/doc.pdfs"))
+
+    def test_most_specific_group_wins(self):
+        rp = sa.RobotsRules("User-agent: googlebot\nDisallow: /g/\n\n"
+                            "User-agent: *\nDisallow: /\n")
+        self.assertTrue(rp.can_fetch("Googlebot", "https://x/anything"))
+        self.assertFalse(rp.can_fetch("Googlebot", "https://x/g/page"))
+        self.assertFalse(rp.can_fetch("otherbot", "https://x/anything"))
+
+    def test_multi_agent_group_and_crawl_delay(self):
+        rp = sa.RobotsRules("User-agent: alpha\nUser-agent: beta\nDisallow: /x\n\n"
+                            "User-agent: *\nCrawl-delay: 5\n")
+        self.assertFalse(rp.can_fetch("beta", "https://x/x/page"))
+        self.assertEqual(rp.crawl_delay("performify-seo-audit"), 5.0)
+        self.assertIsNone(rp.crawl_delay("alpha"))
+
+    def test_empty_disallow_allows_everything(self):
+        rp = sa.RobotsRules("User-agent: *\nDisallow:\n")
+        self.assertTrue(rp.can_fetch("Googlebot", "https://x/anything"))
+
+
+# ---------------------------------------------------------------- indexability directives
+class TestIndexabilityDirectives(unittest.TestCase):
+    def test_googlebot_meta_counts(self):
+        self.assertTrue(sa.is_noindexed([], ["noindex"], []))
+
+    def test_none_means_noindex(self):
+        self.assertTrue(sa.is_noindexed(["none"], [], []))
+
+    def test_most_restrictive_wins(self):
+        self.assertTrue(sa.is_noindexed(["noindex", "index"], [], []))
+
+    def test_other_crawlers_header_ignored(self):
+        self.assertFalse(sa.is_noindexed([], [], ["otherbot: noindex"]))
+        self.assertTrue(sa.is_noindexed([], [], ["googlebot: noindex"]))
+
+    def test_directives_with_colons_are_not_agents(self):
+        self.assertFalse(sa.is_noindexed([], [], ["unavailable_after: 25 Jun 2027"]))
+        self.assertFalse(sa.is_noindexed([], [], ["max-snippet: 20"]))
+
+    def test_plain_header_tokens(self):
+        self.assertTrue(sa.is_noindexed([], [], ["noindex, nofollow"]))
+        self.assertFalse(sa.is_noindexed(["index, follow"], [], []))
+
+    def test_end_to_end_through_the_crawler(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            pages = [f"{base}/gb-meta", f"{base}/none-meta", f"{base}/conflict",
+                     f"{base}/other-bot", f"{base}/multi-header"]
+            routes.update({
+                "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+                "/sitemap.xml": (200, XML, sitemap_xml(pages)),
+                "/gb-meta": (200, HTML, html_page(
+                    title="Googlebot meta page title fixture ok", canonical=f"{base}/gb-meta",
+                    head_extra='<meta name="googlebot" content="noindex">')),
+                "/none-meta": (200, HTML, html_page(
+                    title="None directive page title fixture ok", canonical=f"{base}/none-meta",
+                    head_extra='<meta name="robots" content="none">')),
+                "/conflict": (200, HTML, html_page(
+                    title="Conflicting metas page title fixture", canonical=f"{base}/conflict",
+                    head_extra='<meta name="robots" content="noindex">'
+                               '<meta name="robots" content="index">')),
+                "/other-bot": (200, [("Content-Type", "text/html; charset=utf-8"),
+                                     ("X-Robots-Tag", "otherbot: noindex")],
+                               html_page(title="Other bot header page title fixture",
+                                         canonical=f"{base}/other-bot")),
+                "/multi-header": (200, [("Content-Type", "text/html; charset=utf-8"),
+                                        ("X-Robots-Tag", "nofollow"),
+                                        ("X-Robots-Tag", "noindex")],
+                                  html_page(title="Multi header page title fixture ok",
+                                            canonical=f"{base}/multi-header")),
+            })
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4)
+            noindexed = {u for _, u, _ in model["grouped"].get("noindex-in-sitemap", [])}
+            self.assertEqual(noindexed, {f"{base}/gb-meta", f"{base}/none-meta",
+                                         f"{base}/conflict", f"{base}/multi-header"})
+        finally:
+            srv.shutdown()
+
+
+# ---------------------------------------------------------------- adaptive politeness
+class TestThrottle(unittest.TestCase):
+    def test_explicit_delay_is_a_floor(self):
+        t = sa.Throttle(delay=1.0)
+        for _ in range(40):
+            t.record(200)
+        self.assertEqual(t.delay, 1.0)
+
+    def test_throttle_response_backs_off_globally(self):
+        t = sa.Throttle(delay=0.0)
+        t.record(429)
+        self.assertEqual(t.delay, 1.0)
+        t.record(503)
+        self.assertEqual(t.delay, 2.0)
+        for _ in range(10):
+            t.record(429)
+        self.assertEqual(t.delay, 15.0)   # capped
+        self.assertEqual(t.throttled, 12)
+
+    def test_clean_streak_decays_toward_floor(self):
+        t = sa.Throttle(delay=0.5)
+        t.record(429)   # -> 1.0
+        for _ in range(20):
+            t.record(200)
+        self.assertEqual(t.delay, 0.5)
+
+    def test_slow_start_covers_first_ten_fetches(self):
+        t = sa.Throttle(delay=0.0, slow_start=True)
+        delays = [t._next_delay() for _ in range(12)]
+        self.assertEqual(delays[:10], [0.5] * 10)
+        self.assertEqual(delays[10:], [0.0, 0.0])
+
+    def test_robots_crawl_delay_raises_floor(self):
+        t = sa.Throttle(delay=0.2)
+        t.raise_floor(2.0)
+        self.assertEqual(t.delay, 2.0)
+        t.record(429)   # -> 4.0
+        for _ in range(20):
+            t.record(200)
+        self.assertEqual(t.delay, 2.0)    # decays to the robots floor, not below
+
+    def test_adaptive_backoff_end_to_end(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            state = {"hits": 0}
+
+            def flaky():
+                state["hits"] += 1
+                if state["hits"] == 1:
+                    return (429, {"Retry-After": "0", "Content-Type": "text/html"}, b"")
+                return (200, HTML, html_page(title="Flaky page title of the fixture ok",
+                                             canonical=f"{base}/flaky"))
+
+            routes.update({
+                "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+                "/sitemap.xml": (200, XML, sitemap_xml([f"{base}/", f"{base}/flaky"])),
+                "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                           canonical=f"{base}/")),
+                "/flaky": flaky,
+            })
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=2)
+            pol = model["politeness"]
+            self.assertEqual(pol["throttled"], 1)          # the transient 429 was seen...
+            self.assertGreaterEqual(pol["peak_delay"], 1.0)  # ...and slowed the whole crawl
+            self.assertNotIn("rate-limited", model["grouped"])  # but the retry recovered
+        finally:
+            srv.shutdown()
+
+    def test_robots_crawl_delay_honoured_in_run(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            routes.update({
+                "/robots.txt": (200, TXT,
+                                f"User-agent: *\nAllow: /\nCrawl-delay: 1\n"
+                                f"Sitemap: {base}/sitemap.xml\n".encode()),
+                "/sitemap.xml": (200, XML, sitemap_xml([f"{base}/"])),
+                "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                           canonical=f"{base}/")),
+            })
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=2)
+            pol = model["politeness"]
+            self.assertEqual(pol["robots_crawl_delay"], 1.0)
+            self.assertGreaterEqual(pol["floor"], 1.0)
+            report = sa.build_report(model, md=True)
+            self.assertIn("Crawl-delay 1s honoured", report)
+        finally:
+            srv.shutdown()
+
+
+# ---------------------------------------------------------------- discovery cap
+class TestSitemapDiscoveryCap(unittest.TestCase):
+    def test_truncation_is_flagged_and_reported(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            children = [f"{base}/sm{i}.xml" for i in range(60)]
+            routes["/robots.txt"] = (200, TXT, f"User-agent: *\nAllow: /\n".encode())
+            routes["/sitemap.xml"] = (200, XML, sitemap_index(children))
+            for i in range(60):
+                routes[f"/sm{i}.xml"] = (200, XML, sitemap_xml([f"{base}/p{i}"]))
+                routes[f"/p{i}"] = (200, HTML, html_page(
+                    title=f"Page {i} title of the fixture site okay", canonical=f"{base}/p{i}"))
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=5, workers=4)
+            self.assertTrue(model["sitemap_truncated"])
+            report = sa.build_report(model, md=True)
+            self.assertIn("50-file safety limit", report)
+        finally:
+            srv.shutdown()
 
 
 # ---------------------------------------------------------------- report naming
@@ -742,6 +964,18 @@ class TestStratifiedSampling(unittest.TestCase):
                 source_of[u] = f"{self.BASE}/s{s}.xml"
         sample = sa.stratified_sample(urls, source_of, 12)
         self.assertEqual(len(sample), 12)
+
+    def test_budget_smaller_than_sitemap_count_does_not_crash(self):
+        # regression: a stratum with quota 0 hit ZeroDivisionError in _evenly_spaced
+        urls, source_of = [], {}
+        for s in range(3):
+            for i in range(4):
+                u = f"{self.BASE}/s{s}/p{i}"
+                urls.append(u)
+                source_of[u] = f"{self.BASE}/s{s}.xml"
+        sample = sa.stratified_sample(urls, source_of, 2)
+        self.assertEqual(len(sample), 2)
+        self.assertEqual(sa._evenly_spaced(["a", "b"], 0), [])
 
 
 if __name__ == "__main__":

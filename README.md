@@ -20,7 +20,7 @@ python3 seo_audit.py https://example.com --markdown report.md --json raw.json
 |---|---|---|
 | `--max-pages` | 100 | Stratified sample if the sitemap is larger (see below); `0` = crawl everything |
 | `--workers` | 8 | Concurrent fetches |
-| `--delay` | 0 | Per-worker politeness delay (s) — use `--workers 2 --delay 0.5` on fragile origins |
+| `--delay` | 0 | Politeness floor (s) per fetch — adaptive backoff can raise the effective delay above it, never below (see below) |
 | `--time-budget SECONDS` | 0 (off) | Stop starting new fetches after this long; the report states how many URLs were skipped |
 | `--check-links` | off | Also verify internal link targets that are **not** in the sitemap (capped at 50 extra fetches, most-linked first) |
 | `--explain-scores` | off | Show the score arithmetic and internal issue codes in the report |
@@ -28,10 +28,25 @@ python3 seo_audit.py https://example.com --markdown report.md --json raw.json
 | `--json [FILE]` | — | Dump verdict, coverage, ranking, page data + issues as JSON; auto-names like `--markdown` when FILE is omitted |
 | `--quiet` | — | Suppress progress output |
 
-Rate limiting: 429/503 responses are retried with backoff (honouring `Retry-After`).
+### Adaptive politeness
+
+The crawl detects how polite to be, so `--workers 2 --delay 1` is rarely needed:
+
+- **robots.txt `Crawl-delay`** for the audit UA is honoured as a delay floor (capped
+  at 10s), noted in the report.
+- **Any 429/503 anywhere doubles a shared delay** for every worker (capped 15s) — one
+  throttle signal slows the whole crawl, not just the URL that saw it. Twenty
+  consecutive clean responses halve it back toward the floor.
+- **Slow start**: with no explicit `--delay` on crawls >20 pages, the first 10 fetches
+  run at 0.5s until the origin proves fast.
+
+`--delay` pins the floor exactly — adaptive behaviour only ever makes the crawl
+*more* polite, never faster than your flags. The coverage block states what happened
+("backed off to 4s/fetch after 3 throttle responses") so a rerun is explainable.
+
+Individual 429/503 responses are also retried with backoff (honouring `Retry-After`).
 Pages still throttled after retries are reported as **rate-limited (NOT audited)** — a
-coverage gap, never as broken pages. Shopify storefronts throttle aggressively; use
-`--workers 2 --delay 1` there.
+coverage gap, never as broken pages.
 
 Exit code `0` = no indexation blockers, `2` = indexation blockers found — usable in CI
 or a cron health check.
@@ -69,12 +84,23 @@ OBSERVATIONS               context only, one line each
 
 ### robots.txt handling
 
-Assessment uses `urllib.robotparser` per user-agent group — never line-grepping, so
-`Disallow: /` inside some other bot's group is not misread as a site block. What
-matters for indexation is **Googlebot**: sitemap URLs Googlebot can't fetch are
-blockers, and "site blocked" is derived only when Googlebot is blocked from the
-homepage **and** ≥95% of sitemap URLs. The audit UA being blocked is reported
-separately as an observation ("audit coverage may be limited").
+Assessment uses a small built-in **Google-REP parser** (`urllib.robotparser` on the
+Pythons this tool supports predates the spec: no `*`/`$` wildcards, no longest-match
+precedence — it judges `Allow: /public/` under `Disallow: /` as blocked). The parser
+implements the most-specific user-agent group, longest-path-match with `*` and `$`,
+Allow winning ties — consistently on every Python ≥3.9. What matters for indexation is
+**Googlebot**: sitemap URLs Googlebot can't fetch are blockers, and "site blocked" is
+derived only when Googlebot is blocked from the homepage **and** ≥95% of sitemap URLs.
+The audit UA being blocked is reported separately as an observation ("audit coverage
+may be limited").
+
+Indexability directives are read per Google's spec: every `<meta name="robots">` **and**
+`<meta name="googlebot">` tag, every `X-Robots-Tag` header (including repeated ones and
+agent-prefixed rules — another crawler's `noindex` doesn't count), `none` treated as
+`noindex`, and the most restrictive applicable rule winning.
+
+Sitemap discovery reads at most 50 sitemap files; if an index has more, the report
+carries an explicit warning that totals are incomplete.
 
 ### Priority scoring (transparent by design)
 
