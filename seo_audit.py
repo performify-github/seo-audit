@@ -142,6 +142,158 @@ FIX_HINTS = {
 def issue(code, detail=None):
     return (CLASS_OF[code], code, detail)
 
+
+# ---------------------------------------------------------------- impact ranking
+# Transparent, static scoring: score = impact x confidence x affected_fraction,
+# where affected_fraction = distinct affected URLs / crawled pages (capped at 1).
+# No opaque logic — any ranking in the report can be recomputed by hand from
+# this table. impact = how much it matters when real; confidence = how sure the
+# check is that it matters (1-5 each).
+IMPACT = {
+    "http-error": (5, 5),
+    "fetch-failed": (5, 4),
+    "noindex-in-sitemap": (5, 5),
+    "redirect-problem": (5, 4),
+    "robots-blocks-all": (5, 5),
+    "robots-blocked-sitemap-url": (5, 5),
+    "missing-title": (4, 5),
+    "mixed-content": (4, 4),
+    "redirected-sitemap-url": (3, 4),
+    "duplicate-title": (3, 4),
+    "duplicate-description": (2, 3),
+    "canonical-mismatch": (3, 4),
+    "canonical-target-broken": (4, 4),
+    "canonical-target-redirects": (3, 4),
+    "canonical-target-noindex": (4, 4),
+    "internal-link-broken": (3, 4),
+    "rate-limited": (3, 3),
+    "no-https-redirect": (3, 4),
+    "missing-description": (2, 3),
+    "missing-h1": (2, 2),
+    "title-length": (1, 2),
+    "description-length": (1, 2),
+    "thin-content": (2, 2),
+    "missing-canonical": (2, 2),
+    "slow-fetch-outlier": (2, 2),
+    "robots-missing": (2, 3),
+    "internal-link-redirect": (2, 3),
+    "internal-link-noindex": (2, 3),
+    "orphan-page": (3, 2),
+    # observations all score at the floor
+}
+
+# short human phrases for the generated verdict ({n}/{s} filled in)
+ISSUE_PHRASES = {
+    "http-error": "{n} sitemap URL{s} returning 4xx/5xx",
+    "fetch-failed": "{n} sitemap URL{s} that could not be fetched at all",
+    "noindex-in-sitemap": "{n} noindexed page{s} listed in the sitemap",
+    "redirect-problem": "{n} URL{s} with redirect loops or over-long chains",
+    "robots-blocks-all": "a robots.txt that blocks the whole site",
+    "robots-blocked-sitemap-url": "{n} sitemap URL{s} blocked by robots.txt",
+    "missing-title": "{n} page{s} with no <title>",
+    "mixed-content": "{n} https page{s} loading http subresources",
+    "redirected-sitemap-url": "{n} sitemap URL{s} that redirect",
+    "duplicate-title": "{n} page{s} sharing duplicate titles",
+    "duplicate-description": "{n} page{s} sharing duplicate meta descriptions",
+    "canonical-mismatch": "{n} sitemap page{s} canonicalising elsewhere",
+    "canonical-target-broken": "{n} canonical target{s} not returning 200",
+    "canonical-target-redirects": "{n} canonical target{s} that redirect",
+    "canonical-target-noindex": "{n} noindexed canonical target{s}",
+    "internal-link-broken": "{n} internally linked URL{s} returning 4xx/5xx",
+    "rate-limited": "{n} URL{s} the origin rate-limited (a coverage gap, not a fault)",
+    "no-https-redirect": "an http version that does not redirect to https",
+    "missing-description": "{n} page{s} without a meta description",
+    "missing-h1": "{n} page{s} without an <h1>",
+    "thin-content": "{n} page{s} with little visible text",
+    "missing-canonical": "{n} page{s} without a self-canonical",
+    "slow-fetch-outlier": "{n} page{s} fetching far slower than the site median",
+    "orphan-page": "{n} sitemap URL{s} with no internal links pointing at them",
+    "robots-missing": "a missing robots.txt",
+}
+
+
+def phrase(code, n):
+    s = "s" if n != 1 else ""
+    tpl = ISSUE_PHRASES.get(code)
+    return tpl.format(n=n, s=s) if tpl else f"{n} URL{s} with {code}"
+
+
+def rank_issues(grouped, n_crawled):
+    """Score every issue group. Returns dicts sorted by score desc."""
+    ranked = []
+    for code, items in grouped.items():
+        if not items:
+            continue
+        cls = items[0][0]
+        urls = list(dict.fromkeys(u for _, u, _ in items))
+        imp, conf = IMPACT.get(code, (1, 1))
+        frac = min(1.0, len(urls) / n_crawled) if n_crawled else 0.0
+        ranked.append({"code": code, "class": cls, "n": len(urls),
+                       "impact": imp, "confidence": conf, "fraction": round(frac, 3),
+                       "score": round(imp * conf * frac, 2)})
+    ranked.sort(key=lambda e: (-e["score"], CLASS_ORDER.index(e["class"]), e["code"]))
+    return ranked
+
+
+# ---------------------------------------------------------------- clustering
+def first_segment(url):
+    seg = urllib.parse.urlparse(url).path.strip("/").split("/")[0]
+    return f"/{seg}/" if seg else "/"
+
+
+def cluster_issue(urls, crawled_urls, source_of):
+    """Cluster issue URLs by (source sitemap, first path segment).
+
+    Denominator = crawled pages in the same cluster, so "42/48 product pages"
+    is always a claim about pages actually looked at. Sorted by size desc.
+    """
+    denom = Counter((source_of.get(u), first_segment(u)) for u in crawled_urls)
+    groups = defaultdict(list)
+    for u in urls:
+        groups[(source_of.get(u), first_segment(u))].append(u)
+    out = []
+    for (sm, seg), us in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        out.append({"n": len(us), "of": denom.get((sm, seg), 0), "segment": seg,
+                    "sitemap": sm, "examples": us[:3]})
+    return out
+
+
+def cluster_line(cl):
+    """One human line for a cluster, or None if too weak to claim a pattern."""
+    if cl["n"] < 2 or not cl["of"]:
+        return None
+    where = f"under {cl['segment']}" if cl["segment"] != "/" else "at the top level"
+    sm = ""
+    if cl["sitemap"]:
+        sm_name = urllib.parse.urlparse(cl["sitemap"]).path.rsplit("/", 1)[-1] or cl["sitemap"]
+        sm = f" (sitemap {sm_name})"
+    template = " — likely template-level" if cl["n"] >= 3 and cl["n"] / cl["of"] >= 0.8 else ""
+    return f"{cl['n']}/{cl['of']} crawled pages {where}{sm}{template}"
+
+
+def build_verdict(grouped, ranked, n_crawled, crawled_urls, source_of):
+    """1-2 sentences: indexation health first, then the highest-scored issue."""
+    blockers = [e for e in ranked if e["class"] == BLOCKER]
+    if blockers:
+        n_urls = len({u for e in blockers for _, u, _ in grouped[e["code"]]})
+        s1 = f"Indexation problems affect {n_urls} of {n_crawled} crawled URLs."
+    else:
+        s1 = "Indexation is broadly healthy."
+    actionable = [e for e in ranked if e["class"] in (BLOCKER, MATERIAL)]
+    pool = actionable or [e for e in ranked if e["class"] == OPPORTUNITY]
+    if not pool:
+        return s1 + " No issues of note were found."
+    top = pool[0]
+    conc = ""
+    urls = list(dict.fromkeys(u for _, u, _ in grouped[top["code"]]))
+    clusters = cluster_issue(urls, crawled_urls, source_of)
+    if clusters and clusters[0]["of"] and clusters[0]["n"] >= 2 \
+            and clusters[0]["n"] / top["n"] >= 0.6 and clusters[0]["segment"] != "/":
+        conc = f", concentrated under {clusters[0]['segment']}"
+    lead = ("The main issue is " if actionable
+            else "Nothing material was found; the top review item is ")
+    return f"{s1} {lead}{phrase(top['code'], top['n'])}{conc}."
+
 RATE_LIMIT_STATUSES = (429, 503)
 
 
@@ -245,7 +397,12 @@ def parse_sitemap_xml(text):
 
 
 def discover_and_load_sitemaps(start_url, log):
-    """Resolve a sitemap URL or site root into a flat list of page URLs."""
+    """Resolve a sitemap URL or site root into a flat list of page URLs.
+
+    Returns (page_urls, sitemaps_probed, source_of) where source_of maps each
+    page URL to the sitemap it was listed in (first occurrence wins) — kept
+    for stratified sampling and pattern clustering.
+    """
     parsed = urllib.parse.urlparse(start_url)
     candidates, fallbacks = [], []
     looks_like_sitemap = parsed.path.rstrip("/").endswith((".xml", ".xml.gz")) or "sitemap" in parsed.path.lower()
@@ -260,7 +417,7 @@ def discover_and_load_sitemaps(start_url, log):
                     candidates.append(line.split(":", 1)[1].strip())
         fallbacks = [root + "/sitemap.xml", root + "/sitemap_index.xml"]
 
-    seen, pages = set(), []
+    seen, pages, source_of = set(), [], {}
     queue = list(dict.fromkeys(candidates + fallbacks))
     while queue and len(seen) < 50:
         sm = queue.pop(0)
@@ -274,11 +431,13 @@ def discover_and_load_sitemaps(start_url, log):
         if p or children:
             log(f"  sitemap: {sm} — {len(p)} pages, {len(children)} child sitemaps")
         pages += p
+        for u in p:
+            source_of.setdefault(u, sm)
         queue += children
         if pages:
             # a working sitemap was found — no need to probe the guessed fallbacks
             queue = [q for q in queue if q not in fallbacks]
-    return list(dict.fromkeys(pages)), sorted(seen)
+    return list(dict.fromkeys(pages)), sorted(seen), source_of
 
 
 # ---------------------------------------------------------------- HTML parsing
@@ -541,86 +700,131 @@ def c(code, s, tty):
     return f"\033[{code}m{s}\033[0m" if tty else s
 
 
-def build_report(base_url, page_urls, sampled, results, grouped, elapsed, tty=False, md=False, skipped=0):
-    cls_colour = {BLOCKER: "31;1", MATERIAL: "33", OPPORTUNITY: "36", OBSERVATION: "2"}
-    lines = []
-    w = lines.append
-
-    statuses = Counter()
+def coverage_stats(model):
+    """The honest numbers behind the crawl: what was and wasn't looked at."""
+    stats = {"sitemap_total": len(model["page_urls"]), "crawled": len(model["results"]),
+             "sampled": model["sampled"], "skipped": model["skipped"],
+             "indexable_html": 0, "redirected": 0, "broken": 0,
+             "noindexed": 0, "rate_limited": 0, "unreachable": 0}
     fetch_times, ttfbs = [], []
-    for r, _ in results:
+    for r, (_, data) in model["results"]:
         fetch_times.append(r["elapsed"])
         if r.get("ttfb") is not None:
             ttfbs.append(r["ttfb"])
         if r["error"]:
-            statuses["error"] += 1
-        elif r["chain"]:
-            statuses["redirect"] += 1
-        elif r["status"] in RATE_LIMIT_STATUSES:
-            statuses["rate-limited"] += 1
-        elif r["status"] >= 400:
-            statuses[f"{r['status'] // 100}xx"] += 1
-        else:
-            statuses["200"] += 1
+            stats["unreachable"] += 1
+            continue
+        if r["status"] in RATE_LIMIT_STATUSES:
+            stats["rate_limited"] += 1
+            continue
+        if r["status"] >= 400:
+            stats["broken"] += 1
+            continue
+        if r["chain"]:
+            stats["redirected"] += 1
+        if data.get("noindex"):
+            stats["noindexed"] += 1
+        elif data.get("html"):
+            stats["indexable_html"] += 1
+    stats["ttfb_median"] = round(statistics.median(ttfbs), 2) if ttfbs else None
+    stats["fetch_median"] = round(statistics.median(fetch_times), 2) if fetch_times else None
+    stats["fetch_p90"] = (round(sorted(fetch_times)[max(0, int(len(fetch_times) * 0.9) - 1)], 2)
+                          if fetch_times else None)
+    return stats
 
-    counts = Counter()
-    for code, items in grouped.items():
-        for cls, _, _ in items:
-            counts[cls] += 1
 
-    host = urllib.parse.urlparse(base_url).netloc
+def build_report(model, tty=False, md=False):
+    cls_colour = {BLOCKER: "31;1", MATERIAL: "33", OPPORTUNITY: "36", OBSERVATION: "2"}
+    grouped, ranked, cov = model["grouped"], model["ranked"], model["coverage"]
+    crawled_urls = [r["url"] for r, _ in model["results"]]
+    source_of = model["source_of"]
+    lines = []
+    w = lines.append
     h = (lambda s: f"## {s}") if md else (lambda s: c("1", s.upper(), tty))
+    bullet = "- " if md else "  "
+
+    def code_label(code, cls):
+        return f"`{code}`" if md else c(cls_colour[cls], f"[{code}]", tty)
+
+    def clusters_for(code, max_lines=2):
+        urls = list(dict.fromkeys(u for _, u, _ in grouped[code]))
+        out = []
+        for cl in cluster_issue(urls, crawled_urls, source_of)[:max_lines]:
+            line = cluster_line(cl)
+            if line:
+                out.append((line, cl["examples"]))
+        if not out:
+            out.append((None, urls[:3]))
+        return out
+
+    host = urllib.parse.urlparse(model["base"]).netloc
     w(f"# SEO audit — {host}" if md else c("1;4", f"SEO AUDIT — {host}", tty))
     w("")
-    sample_note = f" (sampled from {len(page_urls)} in sitemap)" if sampled else ""
-    budget_note = f" — time budget hit, {skipped} URLs not crawled" if skipped else ""
-    w(f"Crawled {len(results)} pages{sample_note} in {elapsed:.0f}s{budget_note}.")
-    ok = statuses.get("200", 0)
-    rate_limited = statuses.get("rate-limited", 0)
-    rl_note = f" · {rate_limited} rate-limited (NOT audited)" if rate_limited else ""
-    if fetch_times:
-        timing = f"TTFB median {statistics.median(ttfbs):.2f}s · " if ttfbs else ""
-        timing += (f"fetch time median {statistics.median(fetch_times):.2f}s, "
-                   f"p90 {sorted(fetch_times)[int(len(fetch_times) * 0.9) - 1]:.2f}s")
-        w(f"Status: {ok} OK · {statuses.get('redirect', 0)} redirected · "
-          f"{statuses.get('4xx', 0) + statuses.get('5xx', 0)} broken · "
-          f"{statuses.get('error', 0)} unreachable{rl_note}. {timing}.")
-    else:
-        w("No pages fetched.")
-    w("")
-    verdict = (f"{counts[BLOCKER]} indexation blockers, {counts[MATERIAL]} material issues, "
-               f"{counts[OPPORTUNITY]} opportunities, {counts[OBSERVATION]} observations")
-    w(("**" + verdict + "**") if md else c("1", verdict, tty))
+
+    # VERDICT
+    w(h("Verdict"))
+    w(f"{bullet}{model['verdict']}")
     w("")
 
-    for cls in CLASS_ORDER:
-        codes = [(code, items) for code, items in grouped.items() if items and items[0][0] == cls]
-        if not codes:
-            continue
-        w(h(f"{CLASS_LABELS[cls].title()} ({sum(len(i) for _, i in codes)})"))
-        for code, items in sorted(codes, key=lambda x: -len(x[1])):
-            label = c(cls_colour[cls], f"[{code}]", tty) if not md else f"`{code}`"
-            w(f"  {label} ×{len(items)}" if not md else f"- {label} ×{len(items)}")
-            for _, url, detail in items[:3]:
-                d = f"  — {detail}" if detail else ""
-                w(f"      {url}{d}" if not md else f"    - {url}{d}")
-            if len(items) > 3:
-                w(f"      … and {len(items) - 3} more" if not md else f"    - … and {len(items) - 3} more")
+    # COVERAGE
+    w(h("Coverage"))
+    sample_note = " (sampled)" if cov["sampled"] else ""
+    budget_note = f" — time budget hit, {cov['skipped']} URLs not crawled" if cov["skipped"] else ""
+    w(f"{bullet}Crawled {cov['crawled']} of {cov['sitemap_total']} sitemap URLs{sample_note} "
+      f"in {model['elapsed']:.0f}s{budget_note}.")
+    w(f"{bullet}Indexable HTML {cov['indexable_html']} · redirected {cov['redirected']} · "
+      f"broken {cov['broken']} · noindexed {cov['noindexed']} · "
+      f"rate-limited {cov['rate_limited']} · unreachable {cov['unreachable']}.")
+    if cov["fetch_median"] is not None:
+        ttfb_note = f"TTFB median {cov['ttfb_median']:.2f}s · " if cov["ttfb_median"] is not None else ""
+        w(f"{bullet}{ttfb_note}fetch time median {cov['fetch_median']:.2f}s, p90 {cov['fetch_p90']:.2f}s.")
+    w("")
+
+    # PRIORITY ACTIONS — top 3 blocker/material by score, inputs visible
+    priority = [e for e in ranked if e["class"] in (BLOCKER, MATERIAL)]
+    w(h("Priority actions"))
+    if not priority:
+        w(f"{bullet}None — no indexation blockers or material issues found.")
+    for i, e in enumerate(priority[:3], 1):
+        code = e["code"]
+        scoring = (f"score {e['score']} = impact {e['impact']} x confidence {e['confidence']} "
+                   f"x {e['n']}/{cov['crawled']} affected")
+        w(f"{i}. {code_label(code, e['class'])} {e['n']} URL{'s' if e['n'] != 1 else ''} — {scoring}")
+        for line, examples in clusters_for(code):
+            if line:
+                w(f"{bullet}   {line}")
+            for u in examples[:2]:
+                w(f"{bullet}     {u}")
+        w(f"{bullet}   Fix: {FIX_HINTS.get(code, code)}")
+    if len(priority) > 3:
+        rest = " · ".join(f"{e['code']} ×{e['n']} (score {e['score']})" for e in priority[3:])
+        w(f"{bullet}Also: {rest}")
+    w("")
+
+    # SECONDARY OPPORTUNITIES — review-not-fix items
+    opps = [e for e in ranked if e["class"] == OPPORTUNITY]
+    if opps:
+        w(h("Secondary opportunities"))
+        for e in opps:
+            code = e["code"]
+            w(f"{bullet}{code_label(code, OPPORTUNITY)} ×{e['n']} — {FIX_HINTS.get(code, code)}")
+            for line, examples in clusters_for(code, max_lines=1):
+                if line:
+                    w(f"{bullet}    {line} — e.g. {examples[0]}")
+                elif examples:
+                    w(f"{bullet}    e.g. {' · '.join(examples[:2])}")
         w("")
 
-    # top actions: blockers first, then material, by page count
-    actionable = [(code, items) for code, items in grouped.items()
-                  if items and items[0][0] in (BLOCKER, MATERIAL)]
-    actionable.sort(key=lambda x: (x[1][0][0] != BLOCKER, -len(x[1])))
-    if actionable:
-        w(h("Top actions"))
-        for i, (code, items) in enumerate(actionable[:3], 1):
-            n = f"{len(items)} page{'s' if len(items) != 1 else ''}"
-            w(f"  {i}. {code} ({n}) — {FIX_HINTS.get(code, code)}"
-              if not md else f"{i}. **{code}** ({n}) — {FIX_HINTS.get(code, code)}")
+    # OBSERVATIONS — one line each, context only
+    obs = [e for e in ranked if e["class"] == OBSERVATION]
+    if obs:
+        w(h("Observations"))
+        for e in obs:
+            w(f"{bullet}{code_label(e['code'], OBSERVATION)} ×{e['n']} — {FIX_HINTS.get(e['code'], e['code'])}")
         w("")
-    if not counts:
-        if results:
+
+    if not ranked:
+        if model["results"]:
             w("No issues found — clean crawl." if not md else "_No issues found — clean crawl._")
         else:
             w("Nothing was crawled — no verdict." if not md else "_Nothing was crawled — no verdict._")
@@ -635,7 +839,7 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lamb
     """
     start = time.monotonic()
     log(f"Discovering sitemap(s) for {base} ...")
-    page_urls, sitemaps = discover_and_load_sitemaps(base, log)
+    page_urls, sitemaps, source_of = discover_and_load_sitemaps(base, log)
     if not page_urls:
         return {"base": base, "sitemaps": sitemaps, "page_urls": []}
 
@@ -693,12 +897,17 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lamb
     for cls, url, detail in timing_checks(results):
         grouped["slow-fetch-outlier"].append((cls, url, detail))
 
-    return {
+    model = {
         "base": base, "sitemaps": sitemaps, "page_urls": page_urls,
-        "sampled": sampled, "targets": targets, "results": results,
-        "pagedata": pagedata, "grouped": grouped, "skipped": skipped,
-        "elapsed": time.monotonic() - start,
+        "source_of": source_of, "sampled": sampled, "targets": targets,
+        "results": results, "pagedata": pagedata, "grouped": grouped,
+        "skipped": skipped, "elapsed": time.monotonic() - start,
     }
+    model["ranked"] = rank_issues(grouped, len(results))
+    model["coverage"] = coverage_stats(model)
+    model["verdict"] = build_verdict(grouped, model["ranked"], len(results),
+                                     [r["url"] for r, _ in results], source_of)
+    return model
 
 
 def has_blockers(grouped):
@@ -732,18 +941,21 @@ def main():
         sys.exit(1)
 
     grouped = model["grouped"]
-    fetch_results = [(raw, None) for raw, _ in model["results"]]
-    print(build_report(base, model["page_urls"], model["sampled"], fetch_results, grouped,
-                       model["elapsed"], tty=tty, skipped=model["skipped"]))
+    print(build_report(model, tty=tty))
 
     if args.markdown:
         with open(args.markdown, "w") as f:
-            f.write(build_report(base, model["page_urls"], model["sampled"], fetch_results, grouped,
-                                 model["elapsed"], md=True, skipped=model["skipped"]) + "\n")
+            f.write(build_report(model, md=True) + "\n")
         log(f"markdown report -> {args.markdown}")
     if args.json:
+        pages_out = [{k: v for k, v in pg.items() if k != "links"} for pg in model["pagedata"]]
         with open(args.json, "w") as f:
-            json.dump({"base": base, "sitemaps": model["sitemaps"], "pages": model["pagedata"],
+            json.dump({"base": base, "sitemaps": model["sitemaps"],
+                       "verdict": model["verdict"], "coverage": model["coverage"],
+                       "ranking": model["ranked"],
+                       "impact_table": {k: {"impact": i, "confidence": cf}
+                                        for k, (i, cf) in IMPACT.items()},
+                       "pages": pages_out,
                        "issues": {k: [{"class": s, "url": u, "detail": d} for s, u, d in v]
                                   for k, v in grouped.items()}}, f, indent=2, default=str)
         log(f"json dump -> {args.json}")

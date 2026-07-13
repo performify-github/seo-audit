@@ -198,6 +198,106 @@ class TestCleanSite(unittest.TestCase):
         self.assertFalse(sa.has_blockers(self.model["grouped"]))
 
 
+# ---------------------------------------------------------------- ranking, verdict, clustering
+class TestRankingAndVerdict(unittest.TestCase):
+    """Impact ranking is hand-recomputable; verdict and clusters read the data."""
+
+    @classmethod
+    def setUpClass(cls):
+        routes = {}
+        cls.srv = make_server(routes)
+        base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.base = base
+        pages_a = [f"{base}/", f"{base}/about", f"{base}/contact"]
+        products = [f"{base}/products/p{i}" for i in range(5)]
+        routes.update({
+            "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+            "/sitemap.xml": (200, XML, sitemap_index([f"{base}/pages.xml", f"{base}/products.xml"])),
+            "/pages.xml": (200, XML, sitemap_xml(pages_a)),
+            "/products.xml": (200, XML, sitemap_xml(products)),
+            "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                       canonical=f"{base}/")),
+            "/about": (200, HTML, html_page(title="About page title of the fixture site",
+                                            canonical=f"{base}/about")),
+            "/contact": (200, HTML, html_page(title="Contact page title of the fixture ok",
+                                              canonical=f"{base}/contact")),
+            # 4 of 5 product pages 404 — a template-shaped failure
+            "/products/p4": (200, HTML, html_page(title="Product four page title fixture ok",
+                                                  canonical=f"{base}/products/p4")),
+        })
+        cls.model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def test_scores_recomputable_by_hand(self):
+        crawled = len(self.model["results"])
+        for e in self.model["ranked"]:
+            imp, conf = sa.IMPACT.get(e["code"], (1, 1))
+            expected = round(imp * conf * min(1.0, e["n"] / crawled), 2)
+            self.assertEqual(e["score"], expected, e["code"])
+
+    def test_top_priority_is_http_error(self):
+        priority = [e for e in self.model["ranked"] if e["class"] in (sa.BLOCKER, sa.MATERIAL)]
+        self.assertEqual(priority[0]["code"], "http-error")
+
+    def test_verdict_names_blockers_and_concentration(self):
+        v = self.model["verdict"]
+        self.assertIn("Indexation problems affect 4 of 8 crawled URLs", v)
+        self.assertIn("4 sitemap URLs returning 4xx/5xx", v)
+        self.assertIn("concentrated under /products/", v)
+
+    def test_cluster_denominator_is_crawled_pages(self):
+        urls = [u for _, u, _ in self.model["grouped"]["http-error"]]
+        crawled = [r["url"] for r, _ in self.model["results"]]
+        clusters = sa.cluster_issue(urls, crawled, self.model["source_of"])
+        top = clusters[0]
+        self.assertEqual((top["n"], top["of"], top["segment"]), (4, 5, "/products/"))
+        line = sa.cluster_line(top)
+        self.assertIn("4/5 crawled pages under /products/", line)
+        self.assertIn("products.xml", line)
+        self.assertIn("likely template-level", line)
+
+    def test_source_sitemap_tracked(self):
+        self.assertTrue(self.model["source_of"][f"{self.base}/products/p0"].endswith("/products.xml"))
+        self.assertTrue(self.model["source_of"][f"{self.base}/about"].endswith("/pages.xml"))
+
+    def test_report_sections(self):
+        report = sa.build_report(self.model, md=True)
+        for section in ("## Verdict", "## Coverage", "## Priority actions"):
+            self.assertIn(section, report)
+        self.assertIn("score", report)
+        self.assertIn("impact 5 x confidence 5", report)
+
+    def test_coverage_stats(self):
+        cov = self.model["coverage"]
+        self.assertEqual(cov["sitemap_total"], 8)
+        self.assertEqual(cov["crawled"], 8)
+        self.assertEqual(cov["broken"], 4)
+        self.assertEqual(cov["indexable_html"], 4)
+
+
+class TestCleanVerdict(unittest.TestCase):
+    def test_clean_site_verdict(self):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            routes.update({
+                "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+                "/sitemap.xml": (200, XML, sitemap_xml([f"{base}/", f"{base}/about"])),
+                "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                           canonical=f"{base}/")),
+                "/about": (200, HTML, html_page(title="About page title of the fixture site",
+                                                canonical=f"{base}/about")),
+            })
+            model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4)
+            self.assertTrue(model["verdict"].startswith("Indexation is broadly healthy."))
+        finally:
+            srv.shutdown()
+
+
 # ---------------------------------------------------------------- timing outliers
 def _timing_result(url, elapsed, status=200, error=None):
     return ({"url": url, "elapsed": elapsed, "status": status, "error": error}, None)
