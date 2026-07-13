@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.robotparser
 from collections import Counter, defaultdict
 from html.parser import HTMLParser
 
@@ -656,8 +657,167 @@ def timing_checks(results):
     return out
 
 
-def site_checks(base_url, pages, log):
-    """Site-level checks: robots.txt, https enforcement, duplicates."""
+# ---------------------------------------------------------------- link graph
+def _strip_www(netloc):
+    n = netloc.lower()
+    return n[4:] if n.startswith("www.") else n
+
+
+def build_link_graph(results, base_netloc):
+    """Index crawled pages by normalised URL and count internal inlinks.
+
+    Each target is counted once per linking page; self-links are ignored.
+    Built entirely from the crawl — no new requests.
+    """
+    index = {}
+    # a page's own crawl record wins over being some other URL's redirect target
+    for r, (_, data) in results:
+        index.setdefault(norm_url(r["url"]), (r, data))
+    for r, (_, data) in results:
+        index.setdefault(norm_url(r.get("final_url") or r["url"]), (r, data))
+    inlinks = Counter()
+    base_host = _strip_www(base_netloc)
+    for r, (_, data) in results:
+        src_final = r.get("final_url") or r["url"]
+        seen = set()
+        for href in data.get("links") or []:
+            absu = urllib.parse.urljoin(src_final, href)
+            sp = urllib.parse.urlsplit(absu)
+            if sp.scheme not in ("http", "https") or _strip_www(sp.netloc) != base_host:
+                continue
+            t = norm_url(absu)
+            if t in seen or t in (norm_url(src_final), norm_url(r["url"])):
+                continue
+            seen.add(t)
+            inlinks[t] += 1
+    return index, inlinks
+
+
+def link_checks(index, inlinks):
+    """Internal links -> broken / redirected / noindexed / canonicalised-away
+    targets. Only judges targets that were crawled — zero extra requests."""
+    issues = defaultdict(list)
+
+    def add(code, url, detail):
+        issues[code].append((CLASS_OF[code], url, detail))
+
+    for target, n in inlinks.items():
+        entry = index.get(target)
+        if entry is None:
+            continue
+        r, data = entry
+        linked = f"linked from {n} crawled page{'s' if n != 1 else ''}"
+        if r["error"]:
+            add("internal-link-broken", r["url"], f"{linked} — {r['error']}")
+        elif r["status"] in RATE_LIMIT_STATUSES:
+            continue  # coverage gap, already reported; can't judge the target
+        elif r["status"] >= 400:
+            add("internal-link-broken", r["url"], f"{linked} — HTTP {r['status']}")
+        elif r["chain"] and target == norm_url(r["url"]):
+            # the link hits the redirecting URL itself, not its destination
+            add("internal-link-redirect", r["url"], f"{linked} — -> {r['final_url']}")
+        elif data.get("noindex"):
+            add("internal-link-noindex", r["url"], linked)
+        elif data.get("canonical_abs") and \
+                norm_url(data["canonical_abs"]) != norm_url(r.get("final_url") or r["url"]):
+            add("internal-link-canonicalised", r["url"],
+                f"{linked} — canonicalises to {data['canonical_abs']}")
+    return issues
+
+
+def orphan_checks(page_urls, results, inlinks):
+    """Sitemap URLs with zero internal inlinks across the crawl.
+
+    Only statistically valid at high coverage: with a sampled crawl, "no
+    inlinks found" mostly means "the linking pages weren't crawled". Suppressed
+    entirely below 80% sitemap coverage — a sampled run must never lead with an
+    orphan claim.
+    """
+    if not page_urls or len(results) / len(page_urls) < 0.8:
+        return {}
+    issues = defaultdict(list)
+    for r, (_, data) in results:
+        if r["error"] or not data.get("html") or r["status"] >= 400 or data.get("noindex"):
+            continue
+        if urllib.parse.urlparse(r["url"]).path in ("", "/"):
+            continue  # the homepage needs no inlinks
+        norms = {norm_url(r["url"]), norm_url(r.get("final_url") or r["url"])}
+        if not any(inlinks.get(nu, 0) for nu in norms):
+            issues["orphan-page"].append((CLASS_OF["orphan-page"], r["url"],
+                                          "no internal links found in the crawl"))
+    return issues
+
+
+def _judge_canonical_target(r, noindex, sources):
+    """Classify one canonical target from its fetch result. Returns (code, detail) or None."""
+    n = len(sources)
+    for_pages = f"canonical for {n} crawled page{'s' if n != 1 else ''}"
+    if r["error"]:
+        return "canonical-target-broken", f"{r['error']} — {for_pages}"
+    if r["status"] >= 400:
+        return "canonical-target-broken", f"HTTP {r['status']} — {for_pages}"
+    if r["chain"]:
+        return "canonical-target-redirects", f"-> {r['final_url']} — {for_pages}"
+    if noindex:
+        return "canonical-target-noindex", for_pages
+    return None
+
+
+def canonical_target_checks(results, index, base_netloc, log, max_fetch=50):
+    """Validate where canonicals point. Crawled targets are judged from crawl
+    data; at most max_fetch deduped out-of-crawl targets get fetched."""
+    issues = defaultdict(list)
+    base_host = _strip_www(base_netloc)
+    targets = {}   # norm target -> {"url": abs url, "sources": [page urls]}
+    for r, (_, data) in results:
+        canon = data.get("canonical_abs")
+        if not canon or norm_url(canon) == norm_url(r.get("final_url") or r["url"]):
+            continue
+        t = targets.setdefault(norm_url(canon), {"url": canon, "sources": []})
+        t["sources"].append(r["url"])
+
+    to_fetch = []
+    for nt, t in targets.items():
+        if len(t["sources"]) >= 5:
+            issues["canonical-consolidation"].append(
+                (CLASS_OF["canonical-consolidation"], t["url"],
+                 f"{len(t['sources'])} crawled pages canonicalise here"))
+        if _strip_www(urllib.parse.urlsplit(t["url"]).netloc) != base_host:
+            for src in t["sources"]:
+                issues["cross-domain-canonical"].append(
+                    (CLASS_OF["cross-domain-canonical"], src, f"-> {t['url']}"))
+            continue
+        if nt in index:
+            r, data = index[nt]
+            verdict = _judge_canonical_target(r, data.get("noindex"), t["sources"])
+            if verdict:
+                issues[verdict[0]].append((CLASS_OF[verdict[0]], t["url"], verdict[1]))
+        else:
+            to_fetch.append(t)
+
+    if len(to_fetch) > max_fetch:
+        log(f"  canonical targets: fetching {max_fetch} of {len(to_fetch)} out-of-crawl targets")
+    for t in to_fetch[:max_fetch]:
+        r = fetch_with_retry(t["url"])
+        noindex = "noindex" in (r["headers"].get("X-Robots-Tag") or "").lower()
+        if not noindex and not r["error"] and r["status"] and r["status"] < 400 \
+                and "html" in r["headers"].get("Content-Type", ""):
+            p = PageParser()
+            try:
+                p.feed(decode_body(r))
+                p.close()
+            except Exception:
+                pass
+            noindex = "noindex" in (p.robots_meta or "")
+        verdict = _judge_canonical_target(r, noindex, t["sources"])
+        if verdict:
+            issues[verdict[0]].append((CLASS_OF[verdict[0]], t["url"], verdict[1]))
+    return issues
+
+
+def site_checks(base_url, pages, sitemap_urls, log):
+    """Site-level checks: robots.txt (including per-URL robotparser validation
+    of every sitemap URL), https enforcement, duplicates."""
     issues = defaultdict(list)   # code -> [(class, url, detail)]
     parsed = urllib.parse.urlparse(base_url)
     root = f"{parsed.scheme}://{parsed.netloc}"
@@ -671,11 +831,22 @@ def site_checks(base_url, pages, log):
                                          f"HTTP {r['status']}"))
     else:
         body = decode_body(r)
-        if re.search(r"^user-agent:\s*\*\s*$", body, re.I | re.M) and \
-           re.search(r"^disallow:\s*/\s*$", body, re.I | re.M):
+        blanket = bool(re.search(r"^user-agent:\s*\*\s*$", body, re.I | re.M) and
+                       re.search(r"^disallow:\s*/\s*$", body, re.I | re.M))
+        if blanket:
             issues["robots-blocks-all"].append((BLOCKER, root + "/robots.txt", "Disallow: /"))
         if "sitemap:" not in body.lower():
             issues["robots-no-sitemap"].append((OBSERVATION, root + "/robots.txt", None))
+        if not blanket:
+            # sitemap-listed-but-robots-blocked = contradictory signals per URL
+            rp = urllib.robotparser.RobotFileParser()
+            rp.parse(body.splitlines())
+            for u in sitemap_urls:
+                for agent in ("Googlebot", "performify-seo-audit"):
+                    if not rp.can_fetch(agent, u):
+                        issues["robots-blocked-sitemap-url"].append(
+                            (BLOCKER, u, f"blocked for {agent}"))
+                        break
 
     if parsed.scheme == "https":
         h = fetch(f"http://{parsed.netloc}/", follow=False)
@@ -892,10 +1063,19 @@ def run_audit(base, max_pages=100, workers=8, delay=0.0, time_budget=0, log=lamb
         pagedata.append(data)
         for cls, code, detail in issues_:
             grouped[code].append((cls, raw["url"], detail))
-    for code, items in site_checks(base, pagedata, log).items():
+    for code, items in site_checks(base, pagedata, page_urls, log).items():
         grouped[code].extend(items)
     for cls, url, detail in timing_checks(results):
         grouped["slow-fetch-outlier"].append((cls, url, detail))
+
+    # internal-link graph, orphans, canonical targets
+    base_netloc = urllib.parse.urlparse(base).netloc
+    graph_index, inlinks = build_link_graph(results, base_netloc)
+    for checks in (link_checks(graph_index, inlinks),
+                   orphan_checks(page_urls, results, inlinks),
+                   canonical_target_checks(results, graph_index, base_netloc, log)):
+        for code, items in checks.items():
+            grouped[code].extend(items)
 
     model = {
         "base": base, "sitemaps": sitemaps, "page_urls": page_urls,

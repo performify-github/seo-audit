@@ -298,6 +298,212 @@ class TestCleanVerdict(unittest.TestCase):
             srv.shutdown()
 
 
+# ---------------------------------------------------------------- link graph
+class TestLinkGraph(unittest.TestCase):
+    """Internal links to broken/redirected/noindexed/canonicalised targets."""
+
+    @classmethod
+    def setUpClass(cls):
+        routes = {}
+        cls.srv = make_server(routes)
+        base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.base = base
+        pages = [f"{base}/", f"{base}/a", f"{base}/b", f"{base}/missing",
+                 f"{base}/redirected", f"{base}/noindexed", f"{base}/canonical-away"]
+        routes.update({
+            "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+            "/sitemap.xml": (200, XML, sitemap_xml(pages)),
+            "/": (200, HTML, html_page(title="Homepage title of the fixture site ok", canonical=f"{base}/",
+                                       links=[f"{base}/a", f"{base}/missing", f"{base}/redirected",
+                                              f"{base}/noindexed", f"{base}/canonical-away"])),
+            "/a": (200, HTML, html_page(title="Page A title of the fixture site okay",
+                                        canonical=f"{base}/a", links=[f"{base}/", f"{base}/b"])),
+            "/b": (200, HTML, html_page(title="Page B title of the fixture site okay",
+                                        canonical=f"{base}/b", links=[f"{base}/a"])),
+            "/missing": (404, HTML, b"<html><body>gone</body></html>"),
+            "/redirected": (301, {"Location": "/a", **HTML}, b""),
+            "/noindexed": (200, HTML, html_page(title="Noindexed page title of fixture site",
+                                                noindex=True, canonical=f"{base}/noindexed")),
+            "/canonical-away": (200, HTML, html_page(title="Canonicalised page title fixture ok",
+                                                     canonical=f"{base}/a")),
+        })
+        cls.model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4)
+        cls.grouped = cls.model["grouped"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def _urls(self, code):
+        return [u for _, u, _ in self.grouped.get(code, [])]
+
+    def test_link_to_broken(self):
+        self.assertEqual(self._urls("internal-link-broken"), [f"{self.base}/missing"])
+        self.assertEqual(self.grouped["internal-link-broken"][0][0], sa.MATERIAL)
+
+    def test_link_to_redirect(self):
+        self.assertEqual(self._urls("internal-link-redirect"), [f"{self.base}/redirected"])
+
+    def test_link_to_noindexed(self):
+        self.assertEqual(self._urls("internal-link-noindex"), [f"{self.base}/noindexed"])
+
+    def test_link_to_canonicalised_away(self):
+        self.assertEqual(self._urls("internal-link-canonicalised"), [f"{self.base}/canonical-away"])
+        self.assertEqual(self.grouped["internal-link-canonicalised"][0][0], sa.OBSERVATION)
+
+    def test_linked_pages_not_orphans(self):
+        self.assertNotIn(f"{self.base}/a", self._urls("orphan-page"))
+        self.assertNotIn(f"{self.base}/b", self._urls("orphan-page"))
+
+
+class TestOrphanGate(unittest.TestCase):
+    """Orphans reported at full coverage, suppressed entirely below 80%."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.routes = {}
+        cls.srv = make_server(cls.routes)
+        base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.base = base
+        pages = [f"{base}/", f"{base}/linked", f"{base}/orphan"]
+        cls.routes.update({
+            "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+            "/sitemap.xml": (200, XML, sitemap_xml(pages)),
+            "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                       canonical=f"{base}/", links=[f"{base}/linked"])),
+            "/linked": (200, HTML, html_page(title="Linked page title of the fixture ok",
+                                             canonical=f"{base}/linked", links=[f"{base}/"])),
+            "/orphan": (200, HTML, html_page(title="Orphan page title of the fixture ok",
+                                             canonical=f"{base}/orphan")),
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def test_reported_at_full_coverage(self):
+        model = sa.run_audit(f"{self.base}/sitemap.xml", max_pages=0, workers=4)
+        urls = [u for _, u, _ in model["grouped"].get("orphan-page", [])]
+        self.assertEqual(urls, [f"{self.base}/orphan"])
+
+    def test_suppressed_at_low_coverage(self):
+        model = sa.run_audit(f"{self.base}/sitemap.xml", max_pages=2, workers=4)
+        self.assertLess(len(model["results"]) / len(model["page_urls"]), 0.8)
+        self.assertNotIn("orphan-page", model["grouped"])
+
+
+class TestCanonicalTargets(unittest.TestCase):
+    """Canonical destinations outside the crawl set get validated (max 50 fetches)."""
+
+    @classmethod
+    def setUpClass(cls):
+        routes = {}
+        cls.srv = make_server(routes)
+        base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.base = base
+        cpages = [f"{base}/c1", f"{base}/c2", f"{base}/c3", f"{base}/c4", f"{base}/c5"]
+        kpages = [f"{base}/k{i}" for i in range(5)]
+        routes.update({
+            "/robots.txt": (200, TXT, f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n".encode()),
+            "/sitemap.xml": (200, XML, sitemap_xml(cpages + kpages)),
+            "/c1": (200, HTML, html_page(title="C1 page title of the fixture site ok",
+                                         canonical=f"{base}/good-target")),
+            "/c2": (200, HTML, html_page(title="C2 page title of the fixture site ok",
+                                         canonical=f"{base}/dead-target")),
+            "/c3": (200, HTML, html_page(title="C3 page title of the fixture site ok",
+                                         canonical=f"{base}/redir-target")),
+            "/c4": (200, HTML, html_page(title="C4 page title of the fixture site ok",
+                                         canonical=f"{base}/noindex-target")),
+            "/c5": (200, HTML, html_page(title="C5 page title of the fixture site ok",
+                                         canonical="https://syndication.example/article")),
+            "/good-target": (200, HTML, html_page(title="Good canonical target title fixture",
+                                                  canonical=f"{base}/good-target")),
+            # /dead-target is unrouted -> 404
+            "/redir-target": (301, {"Location": "/good-target", **HTML}, b""),
+            "/noindex-target": (200, HTML, html_page(title="Noindex canonical target title ok",
+                                                     noindex=True,
+                                                     canonical=f"{base}/noindex-target")),
+        })
+        # five more pages all canonicalising to one destination -> consolidation
+        for i in range(5):
+            routes[f"/k{i}"] = (200, HTML, html_page(
+                title=f"K{i} page title of the fixture site ok",
+                canonical=f"{base}/good-target"))
+        cls.model = sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4)
+        cls.grouped = cls.model["grouped"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def _urls(self, code):
+        return [u for _, u, _ in self.grouped.get(code, [])]
+
+    def test_broken_target(self):
+        self.assertEqual(self._urls("canonical-target-broken"), [f"{self.base}/dead-target"])
+        self.assertEqual(self.grouped["canonical-target-broken"][0][0], sa.MATERIAL)
+
+    def test_redirecting_target(self):
+        self.assertEqual(self._urls("canonical-target-redirects"), [f"{self.base}/redir-target"])
+
+    def test_noindexed_target(self):
+        self.assertEqual(self._urls("canonical-target-noindex"), [f"{self.base}/noindex-target"])
+
+    def test_healthy_target_not_flagged(self):
+        for code in ("canonical-target-broken", "canonical-target-redirects",
+                     "canonical-target-noindex"):
+            self.assertNotIn(f"{self.base}/good-target", self._urls(code))
+
+    def test_cross_domain_is_observation(self):
+        self.assertEqual(self._urls("cross-domain-canonical"), [f"{self.base}/c5"])
+        self.assertEqual(self.grouped["cross-domain-canonical"][0][0], sa.OBSERVATION)
+
+    def test_consolidation_observation(self):
+        items = self.grouped.get("canonical-consolidation", [])
+        self.assertEqual([u for _, u, _ in items], [f"{self.base}/good-target"])
+        self.assertIn("6 crawled pages", items[0][2])
+
+
+class TestRobotsValidation(unittest.TestCase):
+    """Sitemap-listed-but-robots-blocked URLs are indexation blockers."""
+
+    def _run(self, robots_body, pages_extra=()):
+        routes = {}
+        srv = make_server(routes)
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            pages = [f"{base}/", f"{base}/blocked/secret"] + [f"{base}{p}" for p in pages_extra]
+            routes.update({
+                "/robots.txt": (200, TXT, robots_body.encode()),
+                "/sitemap.xml": (200, XML, sitemap_xml(pages)),
+                "/": (200, HTML, html_page(title="Homepage title of the fixture site ok",
+                                           canonical=f"{base}/")),
+                "/blocked/secret": (200, HTML, html_page(
+                    title="Blocked page title of the fixture ok",
+                    canonical=f"{base}/blocked/secret")),
+            })
+            return base, sa.run_audit(f"{base}/sitemap.xml", max_pages=0, workers=4)
+        finally:
+            srv.shutdown()
+
+    def test_blocked_sitemap_url_is_blocker(self):
+        base, model = self._run("User-agent: *\nDisallow: /blocked/\n")
+        items = model["grouped"].get("robots-blocked-sitemap-url", [])
+        self.assertEqual([u for _, u, _ in items], [f"{base}/blocked/secret"])
+        self.assertEqual(items[0][0], sa.BLOCKER)
+        self.assertTrue(sa.has_blockers(model["grouped"]))
+
+    def test_blanket_disallow_reported_once(self):
+        base, model = self._run("User-agent: *\nDisallow: /\n")
+        self.assertIn("robots-blocks-all", model["grouped"])
+        # blanket case must not additionally list every sitemap URL
+        self.assertNotIn("robots-blocked-sitemap-url", model["grouped"])
+
+    def test_unblocked_site_clean(self):
+        base, model = self._run("User-agent: *\nAllow: /\n")
+        self.assertNotIn("robots-blocked-sitemap-url", model["grouped"])
+
+
 # ---------------------------------------------------------------- timing outliers
 def _timing_result(url, elapsed, status=200, error=None):
     return ({"url": url, "elapsed": elapsed, "status": status, "error": error}, None)
