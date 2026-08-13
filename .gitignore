@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+
+# Local-only: brain-aware agent stub (validate.py stub-check needs it on disk;
+# it references private-brain paths and must never ship in the public repo)
+CLAUDE.md
+
+# Auto-timestamped audit outputs (the tool writes these into the cwd)
+seo-audit-*.md
+seo-audit-*.json
