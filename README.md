@@ -199,3 +199,7 @@ target checks, robots blocking, timing outliers, and stratified sampling.
   `--workers 2 --delay 1` before believing them.
 
 Be polite on production origins: defaults are ~8 req/s.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
