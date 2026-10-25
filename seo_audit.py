@@ -498,10 +498,11 @@ def decode_body(result):
 class RobotsRules:
     """Minimal Google-REP robots.txt parser.
 
-    urllib.robotparser predates the 2022 REP spec on the Pythons this tool
-    promises to run on: no * / $ wildcards, no longest-match precedence, and
-    wrong group selection — an Allow: /public/ under Disallow: / is judged
-    blocked. This implements what Google documents: the most specific
+    urllib.robotparser follows RFC 9309 (the 2022 REP standard) only from
+    3.13.14, 3.14.5 and 3.15. On the earlier releases this tool still supports
+    it has no * / $ wildcards, no longest-match precedence and wrong group
+    selection, so an Allow: /public/ under Disallow: / is judged blocked.
+    This implements what Google documents: the most specific
     matching user-agent group, longest-path-match precedence with * and $,
     Allow winning ties, plus Crawl-delay per group (not Google REP, but the
     origin's explicit politeness signal).

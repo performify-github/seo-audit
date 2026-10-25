@@ -90,11 +90,13 @@ OBSERVATIONS               context only, one line each
 
 ### robots.txt handling
 
-Assessment uses a small built-in **Google-REP parser** (`urllib.robotparser` on the
-Pythons this tool supports predates the spec: no `*`/`$` wildcards, no longest-match
-precedence — it judges `Allow: /public/` under `Disallow: /` as blocked). The parser
-implements the most-specific user-agent group, longest-path-match with `*` and `$`,
-Allow winning ties — consistently on every Python ≥3.9. What matters for indexation is
+Assessment uses a small built-in **Google-REP parser**. Python's `urllib.robotparser`
+follows RFC 9309, the 2022 robots.txt standard, only from 3.13.14, 3.14.5 and 3.15. On
+the earlier releases this tool still supports, it applies the first matching rule
+instead of the longest, has no `*`/`$` wildcards, and judges `Allow: /public/` under
+`Disallow: /` as blocked. The parser implements the most-specific user-agent group,
+longest-path-match with `*` and `$`, Allow winning ties, consistently on every
+Python ≥3.9. What matters for indexation is
 **Googlebot**: sitemap URLs Googlebot can't fetch are blockers, and "site blocked" is
 derived only when Googlebot is blocked from the homepage **and** ≥95% of sitemap URLs.
 The audit UA being blocked is reported separately as an observation ("audit coverage
@@ -174,7 +176,7 @@ manufacture duplicates.
 3. **Crawl** — concurrent fetches with manual redirect following (chains and loops are
    recorded), UA `performify-seo-audit/1.0`.
 4. **Check** — ~30 per-page and site-level checks, the link graph, canonical targets,
-   and per-URL robots.txt validation (Googlebot + audit UA via `urllib.robotparser`).
+   and per-URL robots.txt validation (Googlebot + audit UA via the built-in parser).
 5. **Report** — verdict first, impact-ranked, clustered.
 
 ## Testing
@@ -186,8 +188,9 @@ target checks, robots blocking, timing outliers, and stratified sampling.
 ## Limitations (by design)
 
 - **Raw HTML only, no JS rendering** — client-side-rendered SPAs will look emptier than
-  they are. If the raw HTML has no content, that's a finding in itself (crawler-first
-  indexing sees the same), but verify with a rendered crawl before calling it broken.
+  they are. If the raw HTML has no content, that's a finding in itself (raw HTML is
+  what Googlebot fetches before it queues the page for rendering), but verify with a
+  rendered crawl before calling it broken.
 - **Sitemap-scoped discovery** — pages not in the sitemap are not crawled (internal
   links are analysed but not followed). Crawl-depth and full link-equity analysis
   remain Screaming Frog's job; this tool tells you *whether* you need that deeper pass.
